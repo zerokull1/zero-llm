@@ -165,7 +165,7 @@ static inline int zero_gpu_auto_init(ZeroGpuBackend *g, int total_layers, size_t
     if (g->cuMemGetInfo) g->cuMemGetInfo(&free_vram, &total_vram);
     g->free_vram_start = free_vram;
 
-    size_t reserve = 320ULL * 1024ULL * 1024ULL;
+    size_t reserve = 420ULL * 1024ULL * 1024ULL;
     size_t usable = (free_vram > reserve) ? (free_vram - reserve) : 0;
     int fit_layers = (bytes_per_layer > 0) ? (int)(usable / bytes_per_layer) : 0;
     if (fit_layers > total_layers) fit_layers = total_layers;
