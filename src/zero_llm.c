@@ -11,14 +11,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include "auto_hw.h"
-#include "zero_accel.h"
-#include "zero_gpu_ptx.h"
-#include "zero_tok.h"
+#include "zero_engine.h"
 
 #define DEFAULT_MODEL "/home/zero/AI_Models/qwen2.5-coder-7b-instruct-q8_0.gguf"
-#define MAX_LAYERS_CAP 128
-#define VOCAB_MAX 262144
 #define NUM_LAYERS ((int)m->n_layers)
 #define HIDDEN (m->hidden_dim)
 #define FFN_DIM (m->ffn_dim)
@@ -30,31 +25,7 @@
 #define ROPE_THETA (m->rope_theta)
 #define RMS_EPS 1e-6f
 
-typedef struct { uint64_t off; uint32_t rows; uint32_t cols; uint32_t ttype; } TensorRef;
-
-typedef struct {
-    TensorRef attn_norm, q, q_bias, k, k_bias, v, v_bias, o;
-    TensorRef ffn_norm, gate, up, down;
-} LayerWeights;
-
-typedef struct {
-    char *vocab[VOCAB_MAX];
-    uint32_t vocab_len[VOCAB_MAX];
-    uint32_t vocab_size;
-    char arch[64], tok_model[32];
-    uint32_t n_layers, hidden_dim, ffn_dim, n_heads, n_kv_heads, head_dim, kv_dim, model_ctx_cap;
-    float rope_theta, rms_eps;
-    int chat_fmt, bos_id, eos_id, nl_id, im_start_id, im_end_id, cpu_threads;
-    AutoHwPlan hw_plan;
-    ZeroTokamakWxArena wx_arena;
-    TensorRef tok_embd, out_norm, output;
-    LayerWeights layers[MAX_LAYERS_CAP];
-    const uint8_t *w_base;
-    uint8_t *mmap_ptr;
-    size_t mmap_sz;
-    ZeroGpuBackend gpu;
-    size_t gpu_off[MAX_LAYERS_CAP][7];
-} QwenWxModel;
+typedef ZeroLlmModel QwenWxModel;
 
 static inline uint64_t rdtscp_now(void) {
     uint32_t lo, hi, aux;
@@ -195,6 +166,8 @@ static int load_qwen_gguf(QwenWxModel *m, const char *path) {
         printf("[ZERO-LLM] GTX 1050 Pascal dp4a synced: %d/%d layers (%.1f MiB GDDR5)\n",
                m->gpu.gpu_layers, NUM_LAYERS, (double)cur / (1024.0 * 1024.0));
     }
+    size_t wx_need = (4U*m->hidden_dim + 2U*m->kv_dim + 2U*m->ffn_dim)*4U + m->ffn_dim + 4096U;
+    if (zero_tokamak_wx_init(&m->wx_arena, wx_need) != 0) return -4;
     return 0;
 }
 
@@ -363,123 +336,6 @@ static float dot_q6k_row(const uint8_t *row_ptr, uint32_t cols, const float *x) 
         }
     }
     return sum;
-}
-
-static void qwen_forward_token(
-    const QwenWxModel *m, int token_id, int pos,
-    float *k_cache, float *v_cache, float *logits, float sparse_thresh
-) {
-    static float *x=NULL,*xb,*q,*k,*v,*att_out,*gate_buf,*up_buf; static int8_t *q8_vec; if(!x){ size_t sz=(4U*HIDDEN+2U*KV_DIM+2U*FFN_DIM)*4U+FFN_DIM+4096U; zero_tokamak_wx_init((ZeroTokamakWxArena*)&m->wx_arena, sz); uint8_t *p=m->wx_arena.work_ptr; x=(float*)p; p+=HIDDEN*4U; xb=(float*)p; p+=HIDDEN*4U; q=(float*)p; p+=HIDDEN*4U; att_out=(float*)p; p+=HIDDEN*4U; k=(float*)p; p+=KV_DIM*4U; v=(float*)p; p+=KV_DIM*4U; gate_buf=(float*)p; p+=FFN_DIM*4U; up_buf=(float*)p; p+=FFN_DIM*4U; q8_vec=(int8_t*)p; }
-
-    if (m->tok_embd.ttype == 8)
-        dequant_q8_row(x, m->w_base + m->tok_embd.off + (size_t)token_id * (HIDDEN / 32) * 34U, HIDDEN);
-    else {
-        const uint16_t *emb16 = (const uint16_t *)(m->w_base + m->tok_embd.off + (size_t)token_id * HIDDEN * 2U);
-        for (uint32_t j = 0; j < HIDDEN; j++) x[j] = f16_to_f32(emb16[j]);
-    }
-
-    for (int l = 0; l < NUM_LAYERS; l++) {
-        const LayerWeights *lw = &m->layers[l];
-        rmsnorm_f32(xb, x, (const float *)(m->w_base + lw->attn_norm.off), HIDDEN);
-        float scale_x = quantize_q8(xb, q8_vec, HIDDEN);
-        const float *qb = lw->q_bias.off ? (const float *)(m->w_base + lw->q_bias.off) : NULL;
-        const float *kb = lw->k_bias.off ? (const float *)(m->w_base + lw->k_bias.off) : NULL;
-        const float *vb = lw->v_bias.off ? (const float *)(m->w_base + lw->v_bias.off) : NULL;
-
-        if (m->gpu.active && l < m->gpu.gpu_layers) {
-            ZeroGpuBackend *g = (ZeroGpuBackend *)&m->gpu;
-            zero_gpu_qkv_stream(g,
-                q, m->gpu_off[l][0], HIDDEN, qb,
-                k, m->gpu_off[l][1], KV_DIM, kb,
-                v, m->gpu_off[l][2], KV_DIM, vb,
-                HIDDEN, q8_vec, scale_x);
-        } else {
-            matvec_q8_avx2(q, m->w_base, lw->q, q8_vec, scale_x, qb);
-            matvec_q8_avx2(k, m->w_base, lw->k, q8_vec, scale_x, kb);
-            matvec_q8_avx2(v, m->w_base, lw->v, q8_vec, scale_x, vb);
-        }
-
-        apply_rope_qwen(m, q, N_HEADS, (uint32_t)pos);
-        apply_rope_qwen(m, k, N_KV_HEADS, (uint32_t)pos);
-
-        size_t kv_off = ((size_t)l * MAX_SEQ + (size_t)pos) * KV_DIM;
-        memcpy(k_cache + kv_off, k, KV_DIM * sizeof(float));
-        memcpy(v_cache + kv_off, v, KV_DIM * sizeof(float));
-
-        const int group_sz = N_HEADS / N_KV_HEADS;
-        const float inv_sqrt_d = 1.0f / sqrtf((float)HEAD_DIM);
-        #pragma omp parallel for schedule(static)
-        for (int h = 0; h < N_HEADS; h++) {
-            int kv_h = h / group_sz;
-            const float *qh = q + h * HEAD_DIM;
-            float *oh = att_out + h * HEAD_DIM, scores[4096], max_s = -1e30f;
-            for (int t = 0; t <= pos; t++) {
-                const float *kh = k_cache + (((size_t)l * MAX_SEQ + (size_t)t) * KV_DIM) + kv_h * HEAD_DIM;
-                float s = 0.0f;
-                for (uint32_t d = 0; d < HEAD_DIM; d++) s += qh[d] * kh[d];
-                s *= inv_sqrt_d; scores[t] = s;
-                if (s > max_s) max_s = s;
-            }
-            float sum_exp = 0.0f;
-            for (int t = 0; t <= pos; t++) { scores[t] = expf(scores[t] - max_s); sum_exp += scores[t]; }
-            float inv_sum = 1.0f / sum_exp;
-            memset(oh, 0, HEAD_DIM * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
-                float p = scores[t] * inv_sum;
-                const float *vh = v_cache + (((size_t)l * MAX_SEQ + (size_t)t) * KV_DIM) + kv_h * HEAD_DIM;
-                for (uint32_t d = 0; d < HEAD_DIM; d++) oh[d] += p * vh[d];
-            }
-        }
-
-        float scale_att = quantize_q8(att_out, q8_vec, HIDDEN);
-        if (m->gpu.active && l < m->gpu.gpu_layers) {
-            ZeroGpuBackend *g = (ZeroGpuBackend *)&m->gpu;
-            zero_gpu_matvec(g, xb, m->gpu_off[l][3], HIDDEN, HIDDEN, q8_vec, scale_att, NULL);
-        } else {
-            matvec_q8_avx2(xb, m->w_base, lw->o, q8_vec, scale_att, NULL);
-        }
-        for (uint32_t i = 0; i < HIDDEN; i++) x[i] += xb[i];
-
-        rmsnorm_f32(xb, x, (const float *)(m->w_base + lw->ffn_norm.off), HIDDEN);
-        float scale_f = quantize_q8(xb, q8_vec, HIDDEN);
-
-        if (m->gpu.active && l < m->gpu.gpu_layers) {
-            ZeroGpuBackend *g = (ZeroGpuBackend *)&m->gpu;
-            zero_gpu_gate_up_stream(g, gate_buf, m->gpu_off[l][4], up_buf, m->gpu_off[l][5], FFN_DIM, HIDDEN, q8_vec, scale_f);
-            for (uint32_t r = 0; r < FFN_DIM; r++) {
-                float gv = gate_buf[r], silu = gv / (1.0f + expf(-gv));
-                up_buf[r] = (fabsf(silu) > sparse_thresh) ? (silu * up_buf[r]) : 0.0f;
-            }
-            float scale_down = quantize_q8(up_buf, q8_vec, FFN_DIM);
-            zero_gpu_matvec(g, xb, m->gpu_off[l][6], HIDDEN, FFN_DIM, q8_vec, scale_down, NULL);
-        } else {
-            matvec_q8_avx2(gate_buf, m->w_base, lw->gate, q8_vec, scale_f, NULL);
-            const uint8_t *up_base = m->w_base + lw->up.off;
-            const size_t up_rb = (HIDDEN / 32) * 34U;
-            #pragma omp parallel for schedule(static)
-            for (uint32_t r = 0; r < FFN_DIM; r++) {
-                float g = gate_buf[r], silu = g / (1.0f + expf(-g));
-                if (fabsf(silu) > sparse_thresh) {
-                    up_buf[r] = silu * dot_q8_row_avx2(up_base + (size_t)r * up_rb, HIDDEN / 32, q8_vec, scale_f);
-                } else up_buf[r] = 0.0f;
-            }
-            float scale_down = quantize_q8(up_buf, q8_vec, FFN_DIM);
-            matvec_q8_avx2(xb, m->w_base, lw->down, q8_vec, scale_down, NULL);
-        }
-        for (uint32_t i = 0; i < HIDDEN; i++) x[i] += xb[i];
-    }
-
-    rmsnorm_f32(xb, x, (const float *)(m->w_base + m->out_norm.off), HIDDEN);
-    if (m->output.ttype == 8) {
-        float scale_out = quantize_q8(xb, q8_vec, HIDDEN);
-        matvec_q8_avx2(logits, m->w_base, m->output, q8_vec, scale_out, NULL);
-    } else {
-        const uint8_t *omat = m->w_base + m->output.off;
-        size_t rb = (HIDDEN / 256U) * 210U;
-        #pragma omp parallel for schedule(static)
-        for (uint32_t r = 0; r < m->vocab_size; r++)
-            logits[r] = dot_q6k_row(omat + (size_t)r * rb, HIDDEN, xb);
-    }
 }
 
 static void qwen_prefill_batch(
@@ -722,7 +578,7 @@ static void generate_reply(
         if (next_tok == 151645 || next_tok == 151643) break;
         print_token_piece(m->vocab[next_tok]);
         gen_count++;
-        qwen_forward_token(m, next_tok, (*pos)++, k_cache, v_cache, logits, sparse_th);
+        zero_forward_token_hot(m, next_tok, (*pos)++, k_cache, v_cache, logits, sparse_th);
     }
     uint64_t dt = rdtscp_now() - t_gen0;
     double sec = (double)dt / 3.3e9;
@@ -784,7 +640,7 @@ int main(int argc, char **argv) {
                 memset(v_cache, 0, kv_bytes);
             }
             for (int i = 0; i < n_turn; i++) {
-                qwen_forward_token(m, prompt_ids[i], pos++, k_cache, v_cache, logits, sparse_th);
+                zero_forward_token_hot(m, prompt_ids[i], pos++, k_cache, v_cache, logits, sparse_th);
             }
             printf("Qwen> "); fflush(stdout);
             generate_reply(m, &pos, max_gen, k_cache, v_cache, logits, sparse_th);
