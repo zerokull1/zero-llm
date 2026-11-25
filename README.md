@@ -60,6 +60,8 @@ Licensed under **GNU AGPL-3.0** (`LICENSE` and `NOTICE`). Original Author & Arch
 - **68-Vector Host & Perimeter Isolation**: Protected by `VT-d` IOMMU DMA isolation, `TokamakBus`, and 68-vector XDP/L7/tarpit/pulse-barrier perimeter defenses.
 - **68-Vector Host & Silicon Cache Isolation**: Protected by `VT-d` IOMMU DMA isolation, `TokamakBus`, and 68-vector XDP/L7/tarpit/Core #3 L1d canary defenses.
 
+- **Hardware-Calibrated Master Pulse & 68-Vector Continuum**: Host timing anchored to UEFI `HardwarePulseAnchor` with `VT-d` IOMMU DMA isolation and **68 audited perimeter/kernel vectors**.
+
 ## Roadmap
 - **Phase 1 [Done]:** Hardened GGUF parser + `VT-d` IOMMU DMA isolation + 68-vector host boundary.
 - **Phase 2–4 [Next]:** Zero-copy telemetry summarization from `TokamakBus` & dedicated CPU inference pinning after SmartNIC XDP offload.
