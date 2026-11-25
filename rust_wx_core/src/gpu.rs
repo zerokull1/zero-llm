@@ -171,24 +171,24 @@ impl GpuCluster {
     }
     #[inline(always)] pub unsafe fn layer_dev(&self,layer: usize) -> i32 { (*self.routes.add(layer)).dev_id }
     #[inline(always)] pub unsafe fn route(&self,layer: usize) -> LayerGpuRoute { *self.routes.add(layer) }
-    #[inline(never)] pub unsafe fn upload_x(&self,dev_id: i32,x_u8: *const u8,blocks: usize) {
+    pub unsafe fn upload_x(&self,dev_id: i32,x_u8: *const u8,blocks: usize) {
         let s = &*self.devs.add(dev_id as usize);
         let _ = (self.cu_ctx_set.unwrap_unchecked())(s.ctx);
         let _ = (self.cu_memcpy_htod.unwrap_unchecked())(s.d_x_q8,x_u8 as *const c_void,blocks * 36);
     }
-    #[inline(never)] pub unsafe fn gemv_off(&self,dev_id: i32,d_w: u64,out_byte_off: u64,rows: u32,blocks: u32) {
+    pub unsafe fn gemv_off(&self,dev_id: i32,d_w: u64,out_byte_off: u64,rows: u32,blocks: u32) {
         let s = &*self.devs.add(dev_id as usize);
         let (mut pw,mut px,mut po,mut pr,mut pb) = (d_w,s.d_x_q8,s.d_out_f32 + out_byte_off,rows,blocks);
         let mut p: [*mut c_void;5] = [&mut pw as *mut _ as _,&mut px as *mut _ as _,&mut po as *mut _ as _,&mut pr as *mut _ as _,&mut pb as *mut _ as _];
         let _ = (self.cu_launch_kernel.unwrap_unchecked())(s.kern_fn,rows,1,1,32,1,1,0,core::ptr::null_mut(),p.as_mut_ptr(),core::ptr::null_mut());
     }
 
-    #[inline(never)] pub unsafe fn proj1(&self,dev_id: i32,x_u8: *const u8,w: u64,dst: *mut f32,rows: u32,blocks: u32) {
+    pub unsafe fn proj1(&self,dev_id: i32,x_u8: *const u8,w: u64,dst: *mut f32,rows: u32,blocks: u32) {
         self.upload_x(dev_id,x_u8,blocks as usize);
         self.gemv_off(dev_id,w,0,rows,blocks);
         self.fetch(dev_id,dst,0,(rows as usize) * 4);
     }
-    #[inline(never)] pub unsafe fn proj2(&self,dev_id: i32,x_u8: *const u8,w1: u64,w2: u64,d1: *mut f32,d2: *mut f32,rows: u32,blocks: u32) {
+    pub unsafe fn proj2(&self,dev_id: i32,x_u8: *const u8,w1: u64,w2: u64,d1: *mut f32,d2: *mut f32,rows: u32,blocks: u32) {
         let b = (rows as u64) * 4;
         self.upload_x(dev_id,x_u8,blocks as usize);
         self.gemv_off(dev_id,w1,0,rows,blocks);
@@ -196,7 +196,7 @@ impl GpuCluster {
         self.fetch(dev_id,d1,0,b as usize);
         self.fetch(dev_id,d2,b,b as usize);
     }
-    #[inline(never)] pub unsafe fn fetch(&self,dev_id: i32,dst_f32: *mut f32,out_byte_off: u64,bytes: usize) {
+    pub unsafe fn fetch(&self,dev_id: i32,dst_f32: *mut f32,out_byte_off: u64,bytes: usize) {
         let s = &*self.devs.add(dev_id as usize);
         let _ = (self.cu_ctx_sync.unwrap_unchecked())();
         let _ = (self.cu_memcpy_dtoh.unwrap_unchecked())(dst_f32 as *mut c_void,s.d_out_f32 + out_byte_off,bytes);

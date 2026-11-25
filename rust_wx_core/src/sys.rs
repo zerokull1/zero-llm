@@ -59,3 +59,31 @@ pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
     while i < n { s.add(i).write_volatile(c as u8); i += 1; }
     s
 }
+
+#[repr(C, align(64))]
+pub struct TokamakBus {
+    pub magic: u64,          // 0x5A45524F4C4C4D31 ("ZEROLLM1")
+    pub req_seq: AtomicU64,
+    pub resp_seq: AtomicU64,
+    pub rack_epoch: u64,
+    pub req_len: u32,
+    pub resp_len: u32,
+    pub src_rack: u16,
+    pub ethertype: u16,      // 0 = local shm pulse, 0x88B5 = inter-rack XDP wire frame
+    pub crc64: u64,
+    pub stop: AtomicU32,
+    pub _pad: [u8; 4],
+    pub req_buf: [u8; 4096],
+    pub resp_buf: [u8; 16384],
+}
+
+#[inline(never)]
+pub unsafe fn tokamak_bus_verify(bus: &mut TokamakBus) -> bool {
+    let rlen = bus.req_len as usize;
+    if rlen == 0 || rlen > 500 { return false; }
+    if bus.ethertype == 0x88B5 {
+        if bus.rack_epoch <= bus.resp_seq.load(core::sync::atomic::Ordering::Relaxed) { return false; }
+        if verify_wx_sum(bus.req_buf.as_ptr(), rlen) != bus.crc64 { return false; }
+    }
+    true
+}

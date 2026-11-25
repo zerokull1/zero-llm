@@ -7,7 +7,7 @@ mod gguf;
 mod math;
 mod gpu;
 use gpu::GpuCluster;
-use sys::{CTRL, read_ticks, syscall3, syscall6, verify_wx_sum, w_str, w_u64};
+use sys::{CTRL, TokamakBus, read_ticks, syscall3, syscall6, tokamak_bus_verify, verify_wx_sum, w_str, w_u64};
 use gguf::{LayerOffs, ModelCfg, TensorEntry, build_layer_table, decode_token_clean, encode_greedy_bpe, lookup_offset, lookup_tensor, parse_gguf_index};
 use math::{apply_rope_qwen2, dequant_embd_row, f16_to_f32, gguf_q4_k_dot_f32, gguf_q6_k_dot_f32, fast_exp_neg, quantize_f32_to_q8_0, rms_norm_f32, silu_f32};
 use core::arch::{asm, global_asm};
@@ -250,6 +250,41 @@ unsafe fn forward_token(
     dispatch_gemv(cores, gguf.add(data_base + out_w_off), out_w_gt, x_u8, core::ptr::null_mut(), cfg.vocab, hb)
 }
 
+#[inline(never)]
+unsafe fn infer_turn(
+    gguf: *const u8, data_base: usize, tok_arr_off: usize, embd_off: usize, embd_gt: u32,
+    out_w_off: usize, out_w_gt: u32, onorm_off: usize, lays: &[LayerOffs; 64], cfg: &ModelCfg,
+    gpu: &GpuCluster, cores: usize, work: *mut u8, kv_cache: *mut f32,
+    in_bytes: &[u8], pos: &mut usize, sys_len: usize, out_shm: Option<&mut TokamakBus>
+) -> usize {
+    if *pos > 880 { *pos = sys_len; }
+    let mut prompt_ids = [0usize; 256]; let mut p_cnt = 0usize;
+    if *pos > 0 { prompt_ids[p_cnt] = 198; p_cnt += 1; }
+    prompt_ids[p_cnt] = 151644; p_cnt += 1; prompt_ids[p_cnt] = 872; p_cnt += 1; prompt_ids[p_cnt] = 198; p_cnt += 1;
+    let mut enc_ids = [0usize; 128]; let n_enc = encode_greedy_bpe(gguf, tok_arr_off, in_bytes, &mut enc_ids);
+    let mut e = 0usize; while e < n_enc && p_cnt < 240 { prompt_ids[p_cnt] = enc_ids[e]; p_cnt += 1; e += 1; }
+    prompt_ids[p_cnt] = 151645; p_cnt += 1; prompt_ids[p_cnt] = 198; p_cnt += 1;
+    prompt_ids[p_cnt] = 151644; p_cnt += 1; prompt_ids[p_cnt] = 77091; p_cnt += 1; prompt_ids[p_cnt] = 198; p_cnt += 1;
+    let mut pi = 0usize; let mut next_tok = 0usize;
+    while pi < p_cnt && *pos < 1020 {
+        next_tok = forward_token(gguf, data_base, embd_off, embd_gt, out_w_off, out_w_gt, onorm_off, lays, cfg, gpu, cores, work, kv_cache, prompt_ids[pi], *pos, pi + 1 == p_cnt);
+        *pos += 1; pi += 1;
+    }
+    let mut g_cnt = 0usize; let mut out_p = 0usize;
+    let mut shm = out_shm;
+    while g_cnt < 256 && *pos < 1020 {
+        if next_tok == 151645 || next_tok == 151643 { break; }
+        let mut tbuf = [0u8; 64]; let tl = decode_token_clean(gguf, tok_arr_off, next_tok, &mut tbuf);
+        if let Some(ref mut b) = shm {
+            let mut k = 0usize; while k < tl && out_p < 16380 { b.resp_buf[out_p] = tbuf[k]; out_p += 1; k += 1; }
+        } else { w_str(&tbuf[..tl]); }
+        next_tok = forward_token(gguf, data_base, embd_off, embd_gt, out_w_off, out_w_gt, onorm_off, lays, cfg, gpu, cores, work, kv_cache, next_tok, *pos, true);
+        *pos += 1; g_cnt += 1;
+    }
+    if let Some(ref mut b) = shm { b.resp_len = out_p as u32; }
+    g_cnt
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zero_engine_main(argc: usize, argv: *const *const u8) -> i32 {
     let mut mask = [0u64; 16];
@@ -269,8 +304,17 @@ pub unsafe extern "C" fn zero_engine_main(argc: usize, argv: *const *const u8) -
     if verify_wx_sum(wx, len) != sum || syscall3(10, wx as usize, 4096, 5) != 0 { return 99; }
     let wx_fn = if has_avx2_fma_f16c() { wx as usize } else { gguf_q8_0_dot_f32_fb as *const () as usize };
 
-    let model_ptr = if argc > 1 && !(*argv.add(1)).is_null() { *argv.add(1) }
-                    else { b"/home/zero/AI_Models/qwen2.5-coder-1.5b-instruct-q8_0.gguf\0".as_ptr() };
+    let mut bus_mode = false;
+    let mut model_ptr = b"/home/zero/AI_Models/qwen2.5-coder-1.5b-instruct-q8_0.gguf\0".as_ptr();
+    let mut ai = 1usize;
+    while ai < argc {
+        let ap = *argv.add(ai);
+        if !ap.is_null() {
+            if *ap == b'-' && *ap.add(1) == b'-' && *ap.add(2) == b'b' && *ap.add(3) == b'u' && *ap.add(4) == b's' && *ap.add(5) == 0 { bus_mode = true; }
+            else { model_ptr = ap; }
+        }
+        ai += 1;
+    }
     let fd = syscall6(257, (-100isize) as usize, model_ptr as usize, 0, 0, 0, 0);
     if fd < 0 { return 2; }
     let fsize = syscall3(8, fd as usize, 0, 2) as usize;
@@ -319,6 +363,29 @@ pub unsafe extern "C" fn zero_engine_main(argc: usize, argv: *const *const u8) -
         forward_token(gguf, data_base, embd_off, embd_gt, out_w_off, out_w_gt, onorm_off, lays, &cfg, &gpu, cores, work, kv_cache, sys_seq[sp], pos, false);
         pos += 1; sp += 1;
     }
+    if bus_mode {
+        let bfd = syscall6(257, (-100isize) as usize, b"/dev/shm/zero_llm_bus\0".as_ptr() as usize, 0x42, 0o600, 0, 0);
+        if bfd >= 0 {
+            let bsz = (core::mem::size_of::<TokamakBus>() + 4095) & !4095;
+            let _ = syscall3(77, bfd as usize, bsz, 0);
+            let bus = &mut *(syscall6(9, 0, bsz, 3, 0x01, bfd as usize, 0) as *mut TokamakBus);
+            let _ = syscall3(3, bfd as usize, 0, 0);
+            bus.magic = 0x5A45524F4C4C4D31; bus.req_seq.store(0, Ordering::Relaxed); bus.resp_seq.store(0, Ordering::Relaxed); bus.stop.store(0, Ordering::Relaxed);
+            w_str(b"[TOKAMAK-BUS] /dev/shm/zero_llm_bus READY (EtherType=0x88B5 | Zero-Socket)\n");
+            let mut last_seq = 0u64;
+            while bus.stop.load(Ordering::Acquire) == 0 {
+                let rq = bus.req_seq.load(Ordering::Acquire);
+                if rq == last_seq { let ts: [u64; 2] = [0, 500_000]; let _ = syscall3(35, ts.as_ptr() as usize, 0, 0); continue; }
+                last_seq = rq;
+                if !tokamak_bus_verify(bus) { bus.resp_len = 0; bus.resp_seq.store(rq, Ordering::Release); continue; }
+                let ulen = bus.req_len as usize;
+                let mut s_i = 0usize; while s_i < ulen { if bus.req_buf[s_i] < 0x20 && bus.req_buf[s_i] != 0x09 { bus.req_buf[s_i] = b' '; } s_i += 1; }
+                let _ = infer_turn(gguf, data_base, tok_arr_off, embd_off, embd_gt, out_w_off, out_w_gt, onorm_off, lays, &cfg, &gpu, cores, work, kv_cache, core::slice::from_raw_parts(bus.req_buf.as_ptr(), ulen), &mut pos, sys_len, Some(bus));
+                bus.resp_seq.store(rq, Ordering::Release);
+            }
+            let _ = syscall3(11, bus as *mut TokamakBus as usize, bsz, 0);
+        }
+    } else {
     loop {
         w_str(b"\nYou: ");
         let mut in_buf = [0u8; 512];
@@ -326,48 +393,16 @@ pub unsafe extern "C" fn zero_engine_main(argc: usize, argv: *const *const u8) -
         if n_in <= 0 { break; }
         let mut ulen = n_in as usize;
         while ulen > 0 && (in_buf[ulen - 1] == 0x0A || in_buf[ulen - 1] == 0x0D) { ulen -= 1; }
-        let mut s_i = 0usize;
-        while s_i < ulen { if in_buf[s_i] < 0x20 && in_buf[s_i] != 0x09 { in_buf[s_i] = b' '; } s_i += 1; }
         if ulen == 0 { continue; }
         if (ulen == 4 && &in_buf[..4] == b"exit") || (ulen == 4 && &in_buf[..4] == b"quit") { break; }
-        if pos > 880 { pos = sys_len; }
-
-        let mut prompt_ids = [0usize; 256];
-        let mut p_cnt = 0usize;
-        if pos > 0 { prompt_ids[p_cnt] = 198; p_cnt += 1; }
-        prompt_ids[p_cnt] = 151644; p_cnt += 1;
-        prompt_ids[p_cnt] = 872;    p_cnt += 1;
-        prompt_ids[p_cnt] = 198;    p_cnt += 1;
-        let mut enc_ids = [0usize; 128];
-        let n_enc = encode_greedy_bpe(gguf, tok_arr_off, &in_buf[..ulen], &mut enc_ids);
-        let mut e = 0usize;
-        while e < n_enc && p_cnt < 240 { prompt_ids[p_cnt] = enc_ids[e]; p_cnt += 1; e += 1; }
-        prompt_ids[p_cnt] = 151645; p_cnt += 1;
-        prompt_ids[p_cnt] = 198;    p_cnt += 1;
-        prompt_ids[p_cnt] = 151644; p_cnt += 1;
-        prompt_ids[p_cnt] = 77091;  p_cnt += 1;
-        prompt_ids[p_cnt] = 198;    p_cnt += 1;
-
         w_str(b"AI: ");
-        let mut pi = 0usize; let mut next_tok = 0usize;
-        while pi < p_cnt && pos < 1020 {
-            next_tok = forward_token(gguf, data_base, embd_off, embd_gt, out_w_off, out_w_gt, onorm_off, lays, &cfg, &gpu, cores, work, kv_cache, prompt_ids[pi], pos, pi + 1 == p_cnt);
-            pos += 1; pi += 1;
-        }
         let t_gen0 = read_ticks();
-        let mut g_cnt = 0usize;
-        while g_cnt < 256 && pos < 1020 {
-            if next_tok == 151645 || next_tok == 151643 { break; }
-            let mut tbuf = [0u8; 64];
-            let tl = decode_token_clean(gguf, tok_arr_off, next_tok, &mut tbuf);
-            w_str(&tbuf[..tl]);
-            next_tok = forward_token(gguf, data_base, embd_off, embd_gt, out_w_off, out_w_gt, onorm_off, lays, &cfg, &gpu, cores, work, kv_cache, next_tok, pos, true);
-            pos += 1; g_cnt += 1;
-        }
+        let g_cnt = infer_turn(gguf, data_base, tok_arr_off, embd_off, embd_gt, out_w_off, out_w_gt, onorm_off, lays, &cfg, &gpu, cores, work, kv_cache, &in_buf[..ulen], &mut pos, sys_len, None);
         let t_gen1 = read_ticks();
         w_str(b"\n[TOKENS="); w_u64(g_cnt as u64);
         w_str(b" | CTX_POS="); w_u64(pos as u64);
         w_str(b" | CYCLES="); w_u64(t_gen1.wrapping_sub(t_gen0)); w_str(b"]\n");
+    }
     }
     (&mut *(&raw mut CTRL)).stop.store(1, Ordering::Release);
     if syscall3(10, wx as usize, 4096, 3) == 0 {
