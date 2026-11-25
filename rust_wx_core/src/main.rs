@@ -33,7 +33,7 @@ global_asm!(
     "vextracti128 xmm6, ymm5, 1", "vpaddd xmm5, xmm5, xmm6",
     "vpshufd xmm6, xmm5, 0xEE", "vpaddd xmm5, xmm5, xmm6",
     "vpshufd xmm6, xmm5, 0x55", "vpaddd xmm5, xmm5, xmm6",
-    "vcvtdq2ps xmm5, xmm5", "vfmadd231ss xmm0, xmm4, xmm5",
+    "prefetchnta [rdi + 136]", "vcvtdq2ps xmm5, xmm5", "vfmadd231ss xmm0, xmm4, xmm5",
     "add rdi, 34", "add rsi, 36", "dec rdx", "jnz 2b",
     "3:", "vzeroupper", "ret",
     "gguf_q8_0_dot_f32_asm_end:"
@@ -67,6 +67,21 @@ unsafe extern "C" fn gguf_q8_0_dot_f32_fb(w: *const u8, x: *const u8, blocks: us
         acc += sc * (s as f32); b += 1;
     }
     acc
+}
+
+#[inline(never)]
+unsafe fn cpu_socket_id() -> u32 {
+    let (mut ml, mut apic, mut sh): (u32, u32, u32) = (0, 0, 0);
+    asm!("push rbx", "mov eax, 0", "cpuid", "pop rbx", out("eax") ml, out("ecx") _, out("edx") _, options(nomem));
+    if ml < 0x0B { return 0; }
+    let mut lvl = 0u32;
+    while lvl < 4 {
+        let (eax_o, ecx_o, edx_o): (u32, u32, u32);
+        asm!("push rbx", "mov eax, 0x0B", "cpuid", "pop rbx", inout("ecx") lvl => ecx_o, out("eax") eax_o, out("edx") edx_o, options(nomem));
+        if ((ecx_o >> 8) & 0xFF) == 0 { break; }
+        sh = eax_o & 0x1F; apic = edx_o; lvl += 1;
+    }
+    apic >> sh
 }
 
 static mut TENSOR_TABLE: [TensorEntry; 768] = [TensorEntry { hash: 0, offset: 0, gtype: 0 }; 768];
@@ -283,7 +298,7 @@ pub unsafe extern "C" fn zero_engine_main(argc: usize, argv: *const *const u8) -
     let mut t = 1usize; while t < cores { spawn_worker(stacks.add((t + 1) * 16384), t); t += 1; }
     let gpu = GpuCluster::init_cluster_auto_split(gguf, data_base, lays, &cfg);
 
-    w_str(b"[MODEL-HAL] Layers="); w_u64(cfg.n_layers as u64);
+    w_str(b"[SILICON-HAL] Cores="); w_u64(cores as u64); w_str(b" | SocketID="); w_u64(cpu_socket_id() as u64); w_str(b" | Prefetch=NTA\n[MODEL-HAL] Layers="); w_u64(cfg.n_layers as u64);
     w_str(b" | Hidden="); w_u64(cfg.hidden as u64);
     w_str(b" | FFN="); w_u64(cfg.ffn as u64);
     w_str(b" | Vocab="); w_u64(cfg.vocab as u64);
