@@ -274,16 +274,17 @@ unsafe fn infer_turn(
     }
     let mut g_cnt = 0usize; let mut out_p = 0usize;
     let mut shm = out_shm;
-    while g_cnt < 256 && *pos < 1020 {
+    if let Some(ref mut b) = shm { (&b.resp_len as *const u32 as *const core::sync::atomic::AtomicU32).as_ref().unwrap_unchecked().store(0, Ordering::Release); }
+    while g_cnt < 512 && *pos < 1020 {
         if next_tok == 151645 || next_tok == 151643 { break; }
         let mut tbuf = [0u8; 64]; let tl = decode_token_clean(gguf, tok_arr_off, next_tok, &mut tbuf);
         if let Some(ref mut b) = shm {
             let mut k = 0usize; while k < tl && out_p < 16380 { b.resp_buf[out_p] = tbuf[k]; out_p += 1; k += 1; }
+            (&b.resp_len as *const u32 as *const core::sync::atomic::AtomicU32).as_ref().unwrap_unchecked().store(out_p as u32, Ordering::Release);
         } else { w_str(&tbuf[..tl]); }
         next_tok = forward_token(gguf, data_base, embd_off, embd_gt, out_w_off, out_w_gt, onorm_off, lays, cfg, gpu, cores, work, kv_cache, next_tok, *pos, true);
         *pos += 1; g_cnt += 1;
     }
-    if let Some(ref mut b) = shm { b.resp_len = out_p as u32; }
     g_cnt
 }
 
