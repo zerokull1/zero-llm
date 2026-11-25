@@ -69,9 +69,10 @@ setp.eq.u32 %p1,%r3,0;@!%p1 bra DONE;mul.wide.u32 %rd11,%r1,4;add.u64 %rd3,%rd3,
 pub unsafe fn probe_vulkan_devices() -> u32 {
     let vk = dlopen(b"libvulkan.so.1\0".as_ptr(),1);
     if vk.is_null() { return 0;}
-    let vk_create: unsafe extern "C" fn(*const u64,*const c_void,*mut *mut c_void) -> i32 = core::mem::transmute(dlsym(vk,b"vkCreateInstance\0".as_ptr()));
-    let vk_enum: unsafe extern "C" fn(*mut c_void,*mut u32,*mut *mut c_void) -> i32 = core::mem::transmute(dlsym(vk,b"vkEnumeratePhysicalDevices\0".as_ptr()));
-    let vk_destroy: unsafe extern "C" fn(*mut c_void,*const c_void) = core::mem::transmute(dlsym(vk,b"vkDestroyInstance\0".as_ptr()));
+    let p1 = dlsym(vk,b"vkCreateInstance\0".as_ptr()); let p2 = dlsym(vk,b"vkEnumeratePhysicalDevices\0".as_ptr()); let p3 = dlsym(vk,b"vkDestroyInstance\0".as_ptr()); if p1.is_null() || p2.is_null() || p3.is_null() { return 0; }
+    let vk_create: unsafe extern "C" fn(*const u64,*const c_void,*mut *mut c_void) -> i32 = core::mem::transmute(p1);
+    let vk_enum: unsafe extern "C" fn(*mut c_void,*mut u32,*mut *mut c_void) -> i32 = core::mem::transmute(p2);
+    let vk_destroy: unsafe extern "C" fn(*mut c_void,*const c_void) = core::mem::transmute(p3);
     let mut ci = [0u64;8];ci[0] = 1;
     let mut inst: *mut c_void = core::ptr::null_mut();
     if vk_create(ci.as_ptr(),core::ptr::null(),&mut inst) != 0 || inst.is_null() { return 0;}

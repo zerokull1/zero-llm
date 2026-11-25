@@ -254,7 +254,7 @@ unsafe fn forward_token(
 
 #[inline(never)]
 unsafe fn infer_turn(
-    gguf: *const u8, data_base: usize, tok_arr_off: usize, embd_off: usize, embd_gt: u32,
+    gguf: *const u8, fsize: usize, data_base: usize, tok_arr_off: usize, embd_off: usize, embd_gt: u32,
     out_w_off: usize, out_w_gt: u32, onorm_off: usize, lays: &[LayerOffs; 64], cfg: &ModelCfg,
     gpu: &GpuCluster, cores: usize, work: *mut u8, kv_cache: *mut f32,
     in_bytes: &[u8], pos: &mut usize, sys_len: usize, out_shm: Option<&mut TokamakBus>
@@ -263,7 +263,7 @@ unsafe fn infer_turn(
     let mut prompt_ids = [0usize; 256]; let mut p_cnt = 0usize;
     if *pos > 0 { prompt_ids[p_cnt] = 198; p_cnt += 1; }
     prompt_ids[p_cnt] = 151644; p_cnt += 1; prompt_ids[p_cnt] = 872; p_cnt += 1; prompt_ids[p_cnt] = 198; p_cnt += 1;
-    let mut enc_ids = [0usize; 128]; let n_enc = encode_greedy_bpe(gguf, tok_arr_off, in_bytes, &mut enc_ids);
+    let mut enc_ids = [0usize; 128]; let n_enc = encode_greedy_bpe(gguf, fsize, tok_arr_off, in_bytes, &mut enc_ids);
     let mut e = 0usize; while e < n_enc && p_cnt < 240 { prompt_ids[p_cnt] = enc_ids[e]; p_cnt += 1; e += 1; }
     prompt_ids[p_cnt] = 151645; p_cnt += 1; prompt_ids[p_cnt] = 198; p_cnt += 1;
     prompt_ids[p_cnt] = 151644; p_cnt += 1; prompt_ids[p_cnt] = 77091; p_cnt += 1; prompt_ids[p_cnt] = 198; p_cnt += 1;
@@ -277,7 +277,7 @@ unsafe fn infer_turn(
     if let Some(ref mut b) = shm { (&b.resp_len as *const u32 as *const core::sync::atomic::AtomicU32).as_ref().unwrap_unchecked().store(0, Ordering::Release); }
     while g_cnt < 512 && *pos < 1020 {
         if next_tok == 151645 || next_tok == 151643 { break; }
-        let mut tbuf = [0u8; 64]; let tl = decode_token_clean(gguf, tok_arr_off, next_tok, &mut tbuf);
+        let mut tbuf = [0u8; 64]; let tl = decode_token_clean(gguf, fsize, tok_arr_off, next_tok, &mut tbuf);
         if let Some(ref mut b) = shm {
             let mut k = 0usize; while k < tl && out_p < 16380 { b.resp_buf[out_p] = tbuf[k]; out_p += 1; k += 1; }
             (&b.resp_len as *const u32 as *const core::sync::atomic::AtomicU32).as_ref().unwrap_unchecked().store(out_p as u32, Ordering::Release);
@@ -320,20 +320,20 @@ pub unsafe extern "C" fn zero_engine_main(argc: usize, argv: *const *const u8) -
     }
     let fd = syscall6(257, (-100isize) as usize, model_ptr as usize, 0, 0, 0, 0);
     if fd < 0 { return 2; }
-    let fsize = syscall3(8, fd as usize, 0, 2) as usize;
-    let gguf = syscall6(9, 0, fsize, 1, 0x02, fd as usize, 0) as *const u8;
+    let fsz = syscall3(8, fd as usize, 0, 2); if fsz < 64 { return 3; } let fsize = fsz as usize;
+    let mres = syscall6(9, 0, fsize, 1, 0x02, fd as usize, 0); if mres < 0 && mres > -4096 { return 4; } let gguf = mres as *const u8;
     let _ = syscall3(3, fd as usize, 0, 0);
     let _ = syscall3(28, gguf as usize, fsize, 14);
     if (gguf as *const u32).read_unaligned() != 0x46554747 { return 6; }
 
     let tbl = &mut *(&raw mut TENSOR_TABLE);
     let mut cfg = core::mem::zeroed::<ModelCfg>();
-    let (t_cnt, data_base, tok_arr_off) = parse_gguf_index(gguf, tbl, &mut cfg);
+    let (t_cnt, data_base, tok_arr_off) = match parse_gguf_index(gguf, fsize, tbl, &mut cfg) { Some(v) => v, None => return 7 };
     let (embd_off, embd_gt) = lookup_tensor(tbl, t_cnt, b"token_embd.weight");
-    let (out_w_off, out_w_gt) = { let (o, gt) = lookup_tensor(tbl, t_cnt, b"output.weight"); if o != 0 { (o, gt) } else { (embd_off, embd_gt) } };
+    let (out_w_off, out_w_gt) = { let (o, gt) = lookup_tensor(tbl, t_cnt, b"output.weight"); if o != usize::MAX { (o, gt) } else { (embd_off, embd_gt) } };
     let onorm_off = lookup_offset(tbl, t_cnt, b"output_norm.weight");
     let lays = &mut *(&raw mut LAYERS);
-    build_layer_table(tbl, t_cnt, cfg.n_layers, lays);
+    if !build_layer_table(tbl, t_cnt, cfg.n_layers, lays) || embd_off == usize::MAX || onorm_off == usize::MAX { return 8; }
 
     let work_bytes = ((cfg.hidden * 4 + cfg.ffn * 2 + 1024) * 4 + (cfg.ffn >> 5) * 36 + 4095) & !4095;
     let kv_dim = (cfg.hidden / cfg.n_heads) * cfg.n_kv_heads;
@@ -341,7 +341,7 @@ pub unsafe extern "C" fn zero_engine_main(argc: usize, argv: *const *const u8) -
     let work = syscall6(9, 0, work_bytes, 3, 0x22, (-1isize) as usize, 0) as *mut u8;
     let kv_cache = syscall6(9, 0, kv_bytes, 3, 0x22, (-1isize) as usize, 0) as *mut f32;
     *(&raw mut ACTIVE_WX_FN) = wx_fn;
-    let stacks = syscall6(9, 0, cores * 16384, 3, 0x22, (-1isize) as usize, 0) as *mut u8;
+    let stacks = syscall6(9, 0, (cores + 1) * 16384, 3, 0x22, (-1isize) as usize, 0) as *mut u8;
     let mut t = 1usize; while t < cores { spawn_worker(stacks.add((t + 1) * 16384), t); t += 1; }
     let gpu = GpuCluster::init_cluster_auto_split(gguf, data_base, lays, &cfg);
 
@@ -353,7 +353,7 @@ pub unsafe extern "C" fn zero_engine_main(argc: usize, argv: *const *const u8) -
 
     let sys_prompt = b"You are a concise expert assistant.";
     let mut sys_ids = [0usize; 128];
-    let n_sys = encode_greedy_bpe(gguf, tok_arr_off, sys_prompt, &mut sys_ids);
+    let n_sys = encode_greedy_bpe(gguf, fsize, tok_arr_off, sys_prompt, &mut sys_ids);
     let mut pos = 0usize;
     let mut sys_seq = [0usize; 140];
     sys_seq[0] = 151644; sys_seq[1] = 8948; sys_seq[2] = 198;
@@ -378,12 +378,11 @@ pub unsafe extern "C" fn zero_engine_main(argc: usize, argv: *const *const u8) -
             let mut last_seq = 0u64;
             while bus.stop.load(Ordering::Acquire) == 0 {
                 let rq = bus.req_seq.load(Ordering::Acquire);
-                if rq == last_seq { let ts: [u64; 2] = [0, 500_000]; let _ = syscall3(35, ts.as_ptr() as usize, 0, 0); continue; }
+                if rq == last_seq { (&raw mut bus._pad as *mut u32).write_volatile(0); let _ = syscall3(24, 0, 0, 0); continue; }
                 last_seq = rq;
-                if !tokamak_bus_verify(bus) { bus.resp_len = 0; bus.resp_seq.store(rq, Ordering::Release); continue; }
-                let ulen = bus.req_len as usize;
+                let ulen = tokamak_bus_verify(bus); if ulen == 0 { bus.resp_len = 0; bus.resp_seq.store(rq, Ordering::Release); continue; }
                 let mut s_i = 0usize; while s_i < ulen { if bus.req_buf[s_i] < 0x20 && bus.req_buf[s_i] != 0x09 { bus.req_buf[s_i] = b' '; } s_i += 1; }
-                let _ = infer_turn(gguf, data_base, tok_arr_off, embd_off, embd_gt, out_w_off, out_w_gt, onorm_off, lays, &cfg, &gpu, cores, work, kv_cache, core::slice::from_raw_parts(bus.req_buf.as_ptr(), ulen), &mut pos, sys_len, Some(bus));
+                let _ = infer_turn(gguf, fsize, data_base, tok_arr_off, embd_off, embd_gt, out_w_off, out_w_gt, onorm_off, lays, &cfg, &gpu, cores, work, kv_cache, core::slice::from_raw_parts(bus.req_buf.as_ptr(), ulen), &mut pos, sys_len, Some(bus));
                 bus.resp_seq.store(rq, Ordering::Release);
             }
             let _ = syscall3(11, bus as *mut TokamakBus as usize, bsz, 0);
@@ -400,7 +399,7 @@ pub unsafe extern "C" fn zero_engine_main(argc: usize, argv: *const *const u8) -
         if (ulen == 4 && &in_buf[..4] == b"exit") || (ulen == 4 && &in_buf[..4] == b"quit") { break; }
         w_str(b"AI: ");
         let t_gen0 = read_ticks();
-        let g_cnt = infer_turn(gguf, data_base, tok_arr_off, embd_off, embd_gt, out_w_off, out_w_gt, onorm_off, lays, &cfg, &gpu, cores, work, kv_cache, &in_buf[..ulen], &mut pos, sys_len, None);
+        let g_cnt = infer_turn(gguf, fsize, data_base, tok_arr_off, embd_off, embd_gt, out_w_off, out_w_gt, onorm_off, lays, &cfg, &gpu, cores, work, kv_cache, &in_buf[..ulen], &mut pos, sys_len, None);
         let t_gen1 = read_ticks();
         w_str(b"\n[TOKENS="); w_u64(g_cnt as u64);
         w_str(b" | CTX_POS="); w_u64(pos as u64);

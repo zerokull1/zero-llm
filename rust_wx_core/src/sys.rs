@@ -80,14 +80,14 @@ pub struct TokamakBus {
 }
 
 #[inline(never)]
-pub unsafe fn tokamak_bus_verify(bus: &mut TokamakBus) -> bool {
+pub unsafe fn tokamak_bus_verify(bus: &mut TokamakBus) -> usize {
     let rlen = bus.req_len as usize;
-    if rlen == 0 || rlen > 500 { return false; }
+    if rlen == 0 || rlen > 500 { return 0; }
     if bus.ethertype == 0x88B5 {
-        if bus.rack_epoch <= bus.resp_seq.load(core::sync::atomic::Ordering::Relaxed) { return false; }
-        if verify_wx_sum(bus.req_buf.as_ptr(), rlen) != bus.crc64 { return false; }
+        if bus.rack_epoch <= bus.resp_seq.load(core::sync::atomic::Ordering::Relaxed) { return 0; }
+        if verify_wx_sum(bus.req_buf.as_ptr(), rlen) != bus.crc64 { return 0; }
     }
-    true
+    rlen
 }
 
 #[used]
