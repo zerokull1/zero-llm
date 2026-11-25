@@ -64,6 +64,8 @@ Licensed under **GNU AGPL-3.0** (`LICENSE` and `NOTICE`). Original Author & Arch
 
 - **73-Vector Host, Kernel & Watchdog Isolation**: Protected by `VT-d` IOMMU DMA isolation, `zero_timing_ring0`, zero-allocation `zero-host-guard` (`/proc/[pid]/exe`), and **73 audited perimeter vectors**.
 
+- **73-Vector Host Isolation & Operator Telemetry**: Monitored via `zero-ctl` (SIEM CEF) and `zeromani_hud` v2 alongside `VT-d` IOMMU, `zero_timing_ring0`, and zero-allocation `zero-host-guard` v2.
+
 ## Roadmap
 - **Phase 1 [Done]:** Hardened GGUF parser + `VT-d` IOMMU DMA isolation + 73-vector host boundary.
 - **Phase 2–4 [Next]:** Zero-copy telemetry summarization from `TokamakBus` & dedicated CPU inference pinning after SmartNIC XDP offload.
