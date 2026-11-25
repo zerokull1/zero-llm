@@ -141,6 +141,7 @@ impl GpuCluster {
                     let mut k = 0usize;
                     while k < can_fit {
                         let lw = &lays[next_layer];
+                        if lw.qt != 8 || lw.kt != 8 || lw.vt != 8 || lw.ot != 8 || lw.gt != 8 || lw.ut != 8 || lw.dt != 8 { break; }
                         let mut r = LayerGpuRoute { dev_id: gpu_idx,q:0,k:0,v:0,o:0,gate:0,up:0,down:0 };
                         let pairs: [(&mut u64,usize,usize);7] = [
                             (&mut r.q,lw.q,cfg.hidden*hb*34),(&mut r.k,lw.k,kv_dim*hb*34),(&mut r.v,lw.v,kv_dim*hb*34),

@@ -156,3 +156,123 @@ pub unsafe fn quantize_f32_to_q8_0(x: *const f32, out_q8: *mut u8, dim: usize) {
         b += 1;
     }
 }
+
+pub unsafe extern "C" fn gguf_q4_k_dot_f32(w: *const u8, x: *const u8, blocks32: usize) -> f32 {
+    let sb_cnt = blocks32 >> 3;
+    let mut acc = 0.0f32;
+    let mut sb = 0usize;
+    while sb < sb_cnt {
+        let wp = w.add(sb * 144);
+        let d = f16_to_f32(u16::from_le_bytes([*wp, *wp.add(1)]));
+        let dmin = f16_to_f32(u16::from_le_bytes([*wp.add(2), *wp.add(3)]));
+        let sc_p = wp.add(4);
+        let qs = wp.add(16);
+        let mut p = 0usize;
+        while p < 4 {
+            let q_chunk = qs.add(p * 32);
+            let mut half = 0usize;
+            while half < 2 {
+                let j = p * 2 + half;
+                let (sc, m) = if j < 4 {
+                    ((*sc_p.add(j) & 63) as f32, (*sc_p.add(j + 4) & 63) as f32)
+                } else {
+                    (((*sc_p.add(j + 4) & 0xF) | ((*sc_p.add(j - 4) >> 6) << 4)) as f32,
+                     ((*sc_p.add(j + 4) >> 4) | ((*sc_p.add(j) >> 6) << 4)) as f32)
+                };
+                let xp = x.add((sb * 8 + j) * 36);
+                let xs = *(xp as *const f32);
+                let mut sum_qx = 0i32;
+                let mut sum_x = 0i32;
+                let mut k = 0usize;
+                while k < 32 {
+                    let qv = if half == 0 { *q_chunk.add(k) & 0xF } else { *q_chunk.add(k) >> 4 } as i32;
+                    let xv = *xp.add(4 + k) as i8 as i32;
+                    sum_qx += qv * xv;
+                    sum_x += xv;
+                    k += 1;
+                }
+                acc += xs * (d * sc * (sum_qx as f32) - dmin * m * (sum_x as f32));
+                half += 1;
+            }
+            p += 1;
+        }
+        sb += 1;
+    }
+    acc
+}
+
+pub unsafe extern "C" fn gguf_q6_k_dot_f32(w: *const u8, x: *const u8, blocks32: usize) -> f32 {
+    let sb_cnt = blocks32 >> 3;
+    let mut acc = 0.0f32;
+    let mut sb = 0usize;
+    while sb < sb_cnt {
+        let wp = w.add(sb * 210);
+        let d = f16_to_f32(u16::from_le_bytes([*wp.add(208), *wp.add(209)]));
+        let mut h_idx = 0usize;
+        while h_idx < 2 {
+            let ql = wp.add(h_idx * 64);
+            let qh = wp.add(128 + h_idx * 32);
+            let sc = wp.add(192 + h_idx * 8);
+            let xb = x.add((sb * 8 + h_idx * 4) * 36);
+            let mut l = 0usize;
+            while l < 32 {
+                let is = l >> 4;
+                let ql0 = *ql.add(l); let ql32 = *ql.add(l + 32); let qhv = *qh.add(l);
+                let q1 = (((ql0 & 0xF) | ((qhv & 3) << 4)) as i32) - 32;
+                let q2 = (((ql32 & 0xF) | (((qhv >> 2) & 3) << 4)) as i32) - 32;
+                let q3 = (((ql0 >> 4) | (((qhv >> 4) & 3) << 4)) as i32) - 32;
+                let q4 = (((ql32 >> 4) | (((qhv >> 6) & 3) << 4)) as i32) - 32;
+                let (x0, x1, x2, x3) = (xb, xb.add(36), xb.add(72), xb.add(108));
+                let s0 = *(x0 as *const f32) * (*x0.add(4 + l) as i8 as f32) * (*sc.add(is) as i8 as f32);
+                let s1 = *(x1 as *const f32) * (*x1.add(4 + l) as i8 as f32) * (*sc.add(is + 2) as i8 as f32);
+                let s2 = *(x2 as *const f32) * (*x2.add(4 + l) as i8 as f32) * (*sc.add(is + 4) as i8 as f32);
+                let s3 = *(x3 as *const f32) * (*x3.add(4 + l) as i8 as f32) * (*sc.add(is + 6) as i8 as f32);
+                acc += d * ((q1 as f32) * s0 + (q2 as f32) * s1 + (q3 as f32) * s2 + (q4 as f32) * s3);
+                l += 1;
+            }
+            h_idx += 1;
+        }
+        sb += 1;
+    }
+    acc
+}
+
+pub unsafe fn dequant_embd_row(embd_base: *const u8, gtype: u32, tok: usize, h_dim: usize, out: *mut f32) {
+    if gtype == 14 {
+        let sb_per_row = h_dim >> 8;
+        let row = embd_base.add(tok * sb_per_row * 210);
+        let mut sb = 0usize;
+        while sb < sb_per_row {
+            let wp = row.add(sb * 210);
+            let d = f16_to_f32(u16::from_le_bytes([*wp.add(208), *wp.add(209)]));
+            let mut h_idx = 0usize;
+            while h_idx < 2 {
+                let (ql, qh, sc) = (wp.add(h_idx * 64), wp.add(128 + h_idx * 32), wp.add(192 + h_idx * 8));
+                let dst = out.add(sb * 256 + h_idx * 128);
+                let mut l = 0usize;
+                while l < 32 {
+                    let is = l >> 4;
+                    let (ql0, ql32, qhv) = (*ql.add(l), *ql.add(l + 32), *qh.add(l));
+                    *dst.add(l) = d * (*sc.add(is) as i8 as f32) * ((((ql0 & 0xF) | ((qhv & 3) << 4)) as i32 - 32) as f32);
+                    *dst.add(l + 32) = d * (*sc.add(is + 2) as i8 as f32) * ((((ql32 & 0xF) | (((qhv >> 2) & 3) << 4)) as i32 - 32) as f32);
+                    *dst.add(l + 64) = d * (*sc.add(is + 4) as i8 as f32) * ((((ql0 >> 4) | (((qhv >> 4) & 3) << 4)) as i32 - 32) as f32);
+                    *dst.add(l + 96) = d * (*sc.add(is + 6) as i8 as f32) * ((((ql32 >> 4) | (((qhv >> 6) & 3) << 4)) as i32 - 32) as f32);
+                    l += 1;
+                }
+                h_idx += 1;
+            }
+            sb += 1;
+        }
+    } else {
+        let hb = h_dim >> 5;
+        let row = embd_base.add(tok * hb * 34);
+        let mut b = 0usize;
+        while b < hb {
+            let bp = row.add(b * 34);
+            let sc = f16_to_f32(u16::from_le_bytes([*bp, *bp.add(1)]));
+            let mut k = 0usize;
+            while k < 32 { *out.add((b << 5) + k) = (*bp.add(2 + k) as i8 as f32) * sc; k += 1; }
+            b += 1;
+        }
+    }
+}

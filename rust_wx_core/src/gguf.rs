@@ -1,11 +1,11 @@
 #[derive(Clone, Copy)]
-pub struct TensorEntry { pub hash: u64, pub offset: u64 }
+pub struct TensorEntry { pub hash: u64, pub offset: u64, pub gtype: u32 }
 
 #[derive(Clone, Copy)]
 pub struct LayerOffs {
-    pub anorm: usize, pub q: usize, pub qb: usize, pub k: usize, pub kb: usize,
-    pub v: usize, pub vb: usize, pub o: usize,
-    pub fnorm: usize, pub gate: usize, pub up: usize, pub down: usize,
+    pub anorm: usize, pub q: usize, pub qt: u32, pub qb: usize, pub k: usize, pub kt: u32, pub kb: usize,
+    pub v: usize, pub vt: u32, pub vb: usize, pub o: usize, pub ot: u32,
+    pub fnorm: usize, pub gate: usize, pub gt: u32, pub up: usize, pub ut: u32, pub down: usize, pub dt: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -93,44 +93,51 @@ pub unsafe fn parse_gguf_index(base: *const u8, table: &mut [TensorEntry; 768], 
         table[t].hash = fnv1a_64(core::slice::from_raw_parts(base.add(off + 8), nl));
         off += 8 + nl;
         let ndims = (base.add(off) as *const u32).read_unaligned() as usize;
-        off += 4 + ndims * 8 + 4;
-        table[t].offset = (base.add(off) as *const u64).read_unaligned();
-        off += 8;
+        off += 4 + ndims * 8;
+        table[t].gtype = (base.add(off) as *const u32).read_unaligned();
+        table[t].offset = (base.add(off + 4) as *const u64).read_unaligned();
+        off += 12;
         t += 1;
     }
     (lim, (off + 31) & !31usize, tok_arr_off)
 }
 
-pub fn lookup_offset(table: &[TensorEntry; 768], count: usize, name: &[u8]) -> usize {
+pub fn lookup_tensor(table: &[TensorEntry; 768], count: usize, name: &[u8]) -> (usize, u32) {
     let h = fnv1a_64(name);
     let mut i = 0;
-    while i < count { if table[i].hash == h { return table[i].offset as usize; } i += 1; }
-    0
+    while i < count { if table[i].hash == h { return (table[i].offset as usize, table[i].gtype); } i += 1; }
+    (0, 0)
 }
+pub fn lookup_offset(table: &[TensorEntry; 768], count: usize, name: &[u8]) -> usize { lookup_tensor(table, count, name).0 }
 
-pub fn lookup_layer(table: &[TensorEntry; 768], count: usize, layer: usize, sfx: &[u8]) -> usize {
+pub fn lookup_layer_t(table: &[TensorEntry; 768], count: usize, layer: usize, sfx: &[u8]) -> (usize, u32) {
     let mut b = [0u8; 64];
     b[0] = b'b'; b[1] = b'l'; b[2] = b'k'; b[3] = b'.';
     let mut n = 4usize;
     if layer >= 10 { b[n] = b'0' + (layer / 10) as u8; n += 1; }
     b[n] = b'0' + (layer % 10) as u8; n += 1;
     let mut k = 0; while k < sfx.len() { b[n] = sfx[k]; n += 1; k += 1; }
-    lookup_offset(table, count, &b[..n])
+    lookup_tensor(table, count, &b[..n])
 }
+pub fn lookup_layer(table: &[TensorEntry; 768], count: usize, layer: usize, sfx: &[u8]) -> usize { lookup_layer_t(table, count, layer, sfx).0 }
 
 pub fn build_layer_table(t: &[TensorEntry; 768], c: usize, n_layers: usize, l: &mut [LayerOffs; 64]) {
     let mut i = 0;
     while i < n_layers && i < 64 {
+        let (q, qt) = lookup_layer_t(t, c, i, b".attn_q.weight");
+        let (k, kt) = lookup_layer_t(t, c, i, b".attn_k.weight");
+        let (v, vt) = lookup_layer_t(t, c, i, b".attn_v.weight");
+        let (o, ot) = lookup_layer_t(t, c, i, b".attn_output.weight");
+        let (gate, gt) = lookup_layer_t(t, c, i, b".ffn_gate.weight");
+        let (up, ut) = lookup_layer_t(t, c, i, b".ffn_up.weight");
+        let (down, dt) = lookup_layer_t(t, c, i, b".ffn_down.weight");
         l[i] = LayerOffs {
             anorm: lookup_layer(t, c, i, b".attn_norm.weight"),
-            q: lookup_layer(t, c, i, b".attn_q.weight"), qb: lookup_layer(t, c, i, b".attn_q.bias"),
-            k: lookup_layer(t, c, i, b".attn_k.weight"), kb: lookup_layer(t, c, i, b".attn_k.bias"),
-            v: lookup_layer(t, c, i, b".attn_v.weight"), vb: lookup_layer(t, c, i, b".attn_v.bias"),
-            o: lookup_layer(t, c, i, b".attn_output.weight"),
-            fnorm: lookup_layer(t, c, i, b".ffn_norm.weight"),
-            gate: lookup_layer(t, c, i, b".ffn_gate.weight"),
-            up: lookup_layer(t, c, i, b".ffn_up.weight"),
-            down: lookup_layer(t, c, i, b".ffn_down.weight"),
+            q, qt, qb: lookup_layer(t, c, i, b".attn_q.bias"),
+            k, kt, kb: lookup_layer(t, c, i, b".attn_k.bias"),
+            v, vt, vb: lookup_layer(t, c, i, b".attn_v.bias"),
+            o, ot, fnorm: lookup_layer(t, c, i, b".ffn_norm.weight"),
+            gate, gt, up, ut, down, dt,
         };
         i += 1;
     }
