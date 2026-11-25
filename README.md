@@ -56,3 +56,4 @@ Licensed under **GNU AGPL-3.0** (`LICENSE` and `NOTICE`). Original Author & Arch
 ### Hardware DMA & Bus Isolation
 - **VT-d IOMMU & TokamakBus Protection**: Enforced `intel_iommu=on iommu=force` (`DMAR` isolated PCIe groups) and `mei_me` driver removal so external PCIe controllers cannot perform unauthorized Bus Master DMA into `TokamakBus` (`0x88B5`) or GGUF weight pages.
 - **Isolated Data-Center Deployment**: Protected at host boundary by Pre-OS UEFI network shutdown, `VT-d` IOMMU DMA isolation, and East-West rack quarantine.
+- **58-Vector Host & Perimeter Isolation**: Protected by `VT-d` IOMMU DMA isolation, `TokamakBus`, and 58-vector XDP/L7/tarpit perimeter defenses.
