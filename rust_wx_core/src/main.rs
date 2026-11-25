@@ -42,6 +42,30 @@ unsafe extern "C" {
     fn gguf_q8_0_dot_f32_asm_end();
 }
 
+#[inline(never)]
+unsafe fn has_avx2_fma_f16c() -> bool {
+    let (ml, c1, x0, b7): (u32, u32, u32, u32);
+    asm!("push rbx", "mov eax, 0", "cpuid", "pop rbx", out("eax") ml, out("ecx") _, out("edx") _, options(nomem));
+    if ml < 7 { return false; }
+    asm!("push rbx", "mov eax, 1", "cpuid", "pop rbx", out("eax") _, out("ecx") c1, out("edx") _, options(nomem));
+    if (c1 & ((1<<27)|(1<<12)|(1<<29))) != ((1<<27)|(1<<12)|(1<<29)) { return false; }
+    asm!("xor ecx, ecx", "xgetbv", out("eax") x0, out("edx") _, out("ecx") _, options(nomem, nostack));
+    if (x0 & 6) != 6 { return false; }
+    asm!("push rbx", "mov eax, 7", "xor ecx, ecx", "cpuid", "mov esi, ebx", "pop rbx", out("eax") _, out("esi") b7, out("ecx") _, out("edx") _, options(nomem));
+    (b7 & (1 << 5)) != 0
+}
+unsafe extern "C" fn gguf_q8_0_dot_f32_fb(w: *const u8, x: *const u8, blocks: usize) -> f32 {
+    let mut acc = 0.0f32; let mut b = 0usize;
+    while b < blocks {
+        let wp = w.add(b * 34); let xp = x.add(b * 36);
+        let sc = f16_to_f32(u16::from_le_bytes([*wp, *wp.add(1)])) * *(xp as *const f32);
+        let mut s = 0i32; let mut k = 0usize;
+        while k < 32 { s += (*wp.add(2 + k) as i8 as i32) * (*xp.add(4 + k) as i8 as i32); k += 1; }
+        acc += sc * (s as f32); b += 1;
+    }
+    acc
+}
+
 static mut TENSOR_TABLE: [TensorEntry; 384] = [TensorEntry { hash: 0, offset: 0 }; 384];
 static mut LAYERS: [LayerOffs; 28] = [LayerOffs { anorm:0, q:0, qb:0, k:0, kb:0, v:0, vb:0, o:0, fnorm:0, gate:0, up:0, down:0 }; 28];
 static mut EPOCH_SEQ: u64 = 0;
@@ -54,7 +78,7 @@ extern "C" fn worker_loop(tid: usize) -> ! {
             if unsafe { (*(&raw const CTRL)).stop.load(Ordering::Acquire) } != 0 {
                 unsafe { asm!("mov eax, 60", "xor edi, edi", "syscall", options(noreturn)); }
             }
-            core::hint::spin_loop();
+            let mut sp = 0u32; while sp < 64 { core::hint::spin_loop(); sp += 1; } unsafe { let _ = syscall3(24, 0, 0, 0); }
             ep = unsafe { (*(&raw const CTRL)).epoch.load(Ordering::Acquire) };
         }
         local_ep = ep;
@@ -142,12 +166,8 @@ unsafe fn forward_token(
         let dev_id = gpu.layer_dev(l);
         if dev_id >= 0 {
             let vp = gpu.route(l);
-            gpu.upload_x(dev_id, x_u8, 48);
-            gpu.gemv_off(dev_id, vp.q, 0, 1536, 48);
-            gpu.gemv_off(dev_id, vp.k, 6144, 256, 48);
-            gpu.gemv_off(dev_id, vp.v, 7168, 256, 48);
-            gpu.fetch(dev_id, q_f32, 0, 6144);
-            gpu.fetch(dev_id, k_pos, 6144, 2048);
+            gpu.proj1(dev_id, x_u8, vp.q, q_f32, 1536, 48);
+            gpu.proj2(dev_id, x_u8, vp.k, vp.v, k_pos, v_pos, 256, 48);
         } else {
             dispatch_gemv(cores, gguf.add(data_base + lw.q), x_u8, q_f32, 1536, 48, 1.0f32);
             dispatch_gemv(cores, gguf.add(data_base + lw.k), x_u8, k_pos, 256, 48, 1.0f32);
@@ -196,9 +216,7 @@ unsafe fn forward_token(
 
         quantize_f32_to_q8_0(att_out, x_u8, 1536);
         if dev_id >= 0 {
-            gpu.upload_x(dev_id, x_u8, 48);
-            gpu.gemv_off(dev_id, gpu.route(l).o, 0, 1536, 48);
-            gpu.fetch(dev_id, q_f32, 0, 6144);
+            gpu.proj1(dev_id, x_u8, gpu.route(l).o, q_f32, 1536, 48);
         } else {
             dispatch_gemv(cores, gguf.add(data_base + lw.o), x_u8, q_f32, 1536, 48, 1.0f32);
         }
@@ -208,11 +226,7 @@ unsafe fn forward_token(
         quantize_f32_to_q8_0(norm_f32, x_u8, 1536);
         if dev_id >= 0 {
             let vp = gpu.route(l);
-            gpu.upload_x(dev_id, x_u8, 48);
-            gpu.gemv_off(dev_id, vp.gate, 0, 8960, 48);
-            gpu.gemv_off(dev_id, vp.up, 35840, 8960, 48);
-            gpu.fetch(dev_id, gate_f32, 0, 35840);
-            gpu.fetch(dev_id, up_f32, 35840, 35840);
+            gpu.proj2(dev_id, x_u8, vp.gate, vp.up, gate_f32, up_f32, 8960, 48);
         } else {
             dispatch_gemv(cores, gguf.add(data_base + lw.gate), x_u8, gate_f32, 8960, 48, 1.0f32);
             dispatch_gemv(cores, gguf.add(data_base + lw.up), x_u8, up_f32, 8960, 48, 1.0f32);
@@ -220,9 +234,7 @@ unsafe fn forward_token(
         let mut g = 0usize; while g < 8960 { *gate_f32.add(g) = silu_f32(*gate_f32.add(g)) * (*up_f32.add(g)); g += 1; }
         quantize_f32_to_q8_0(gate_f32, x_u8, 8960);
         if dev_id >= 0 {
-            gpu.upload_x(dev_id, x_u8, 280);
-            gpu.gemv_off(dev_id, gpu.route(l).down, 0, 1536, 280);
-            gpu.fetch(dev_id, q_f32, 0, 6144);
+            gpu.proj1(dev_id, x_u8, gpu.route(l).down, q_f32, 1536, 280);
         } else {
             dispatch_gemv(cores, gguf.add(data_base + lw.down), x_u8, q_f32, 1536, 280, 1.0f32);
         }
@@ -253,6 +265,7 @@ pub unsafe extern "C" fn zero_engine_main() -> i32 {
     let mut c = 0; while c < len { wx.add(c).write_volatile(src.add(c).read()); c += 1; }
     fence(Ordering::SeqCst);
     if verify_wx_sum(wx, len) != sum || syscall3(10, wx as usize, 4096, 5) != 0 { return 99; }
+    let wx_fn = if has_avx2_fma_f16c() { wx as usize } else { gguf_q8_0_dot_f32_fb as *const () as usize };
 
     let fd = syscall6(257, (-100isize) as usize, b"/home/zero/AI_Models/qwen2.5-coder-1.5b-instruct-q8_0.gguf\0".as_ptr() as usize, 0, 0, 0, 0);
     let fsize = syscall3(8, fd as usize, 0, 2) as usize;
@@ -270,7 +283,7 @@ pub unsafe extern "C" fn zero_engine_main() -> i32 {
 
     let work = syscall6(9, 0, 131072, 3, 0x22, (-1isize) as usize, 0) as *mut u8;
     let kv_cache = syscall6(9, 0, 28 * 1024 * 512 * 4, 3, 0x22, (-1isize) as usize, 0) as *mut f32;
-    (&mut *(&raw mut CTRL)).wx_fn = wx as usize;
+    (&mut *(&raw mut CTRL)).wx_fn = wx_fn;
     let stacks = syscall6(9, 0, cores * 16384, 3, 0x22, (-1isize) as usize, 0) as *mut u8;
     let mut t = 1usize; while t < cores { spawn_worker(stacks.add((t + 1) * 16384), t); t += 1; }
     let gpu = GpuCluster::init_cluster_auto_split(gguf, data_base, lays, 28);

@@ -35,3 +35,5 @@ Zero-`libc` (`#![no_std]`, `#![no_main]`, `-nodefaultlibs`, statically linked) M
 
 - **L1i Footprint:** `13 527 B` `.text` (`41.3%` of 32 KB L1i, strictly `<= 16 KB`).
 - **End-to-End Inference:** `~94.6–99 ms/token` (`~10.1–10.6 full tok/s` across all 28 layers x 7 projections + `151,936`-vocab `LM Head Argmax` = `1.54B` `Q8_0` params/token on 4-core Haswell `i5-4590` DDR3).
+
+- **Multi-GPU & Vulkan/CUDA Cluster HAL (`rust_wx_core/src/gpu.rs`):** Auto-probes Vulkan devices (`libvulkan.so.1`) and splits model layers across up to 1024 CUDA GPUs (`28/28` layers offloaded on GTX 1050 2GB) with dynamic `CPUID` (`AVX2+FMA3+F16C` -> scalar fallback) and thermal `SYS_sched_yield` worker backoff (`.text` = **11 394 B**, 34.7% L1i).
