@@ -108,17 +108,23 @@ pub unsafe fn decode_token_clean(base: *const u8, tok_arr_off: usize, target_id:
     let mut s = 0usize; let mut d = 0usize;
     while s < sl && d < 62 {
         let b0 = *src.add(s);
-        if s + 1 < sl && b0 == 0xC4 {
+        if s + 1 < sl && (b0 == 0xC4 || b0 == 0xC5) {
             let b1 = *src.add(s + 1);
-            if b1 == 0xA0 { out[d] = b' '; d += 1; }
-            else if b1 == 0x8A { out[d] = 0x0A; d += 1; }
-            else if b1 >= 0x80 && b1 <= 0xA0 && b1 != 0x8D { out[d] = b1; d += 1; }
+            let cp = (((b0 & 0x1F) as u32) << 6) | ((b1 & 0x3F) as u32);
+            if cp == 0x120 { out[d] = b' '; d += 1; }
+            else if cp == 0x10A { out[d] = 0x0A; d += 1; }
+            else if cp >= 0x121 && cp <= 0x142 { out[d] = (cp - 0xA2) as u8; d += 1; }
+            else if cp == 0x143 { out[d] = 0xAD; d += 1; }
             s += 2;
-        } else if s + 1 < sl && (b0 == 0xC2 || b0 == 0xC3) {
-            let b1 = *src.add(s + 1);
-            out[d] = if b0 == 0xC2 { b1 } else { b1 + 0x40 };
+        } else if s + 1 < sl && b0 == 0xC2 {
+            out[d] = *src.add(s + 1);
             d += 1; s += 2;
-        } else { out[d] = b0; d += 1; s += 1; }
+        } else if s + 1 < sl && b0 == 0xC3 {
+            out[d] = *src.add(s + 1) + 0x40;
+            d += 1; s += 2;
+        } else {
+            out[d] = b0; d += 1; s += 1;
+        }
     }
     d
 }
@@ -131,8 +137,12 @@ pub unsafe fn encode_greedy_bpe(base: *const u8, tok_arr_off: usize, text: &[u8]
         let b = text[i];
         if b == b' ' { norm[nlen] = 0xC4; norm[nlen + 1] = 0xA0; nlen += 2; }
         else if b == 0x0A { norm[nlen] = 0xC4; norm[nlen + 1] = 0x8A; nlen += 2; }
-        else if b >= 0x80 && b <= 0xA0 { norm[nlen] = 0xC4; norm[nlen + 1] = b; nlen += 2; }
-        else if b >= 0xA1 { norm[nlen] = if b < 0xC0 { 0xC2 } else { 0xC3 }; norm[nlen + 1] = if b < 0xC0 { b } else { b - 0x40 }; nlen += 2; }
+        else if b >= 0x7F && b <= 0xA0 {
+            let cp = (b as u32) + 0xA2;
+            norm[nlen] = (0xC0 | (cp >> 6)) as u8; norm[nlen + 1] = (0x80 | (cp & 0x3F)) as u8; nlen += 2;
+        } else if b == 0xAD { norm[nlen] = 0xC5; norm[nlen + 1] = 0x83; nlen += 2; }
+        else if b >= 0xA1 && b < 0xC0 { norm[nlen] = 0xC2; norm[nlen + 1] = b; nlen += 2; }
+        else if b >= 0xC0 { norm[nlen] = 0xC3; norm[nlen + 1] = b - 0x40; nlen += 2; }
         else if b != 0x0D { norm[nlen] = b; nlen += 1; }
         i += 1;
     }
