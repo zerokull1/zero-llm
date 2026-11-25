@@ -5,6 +5,8 @@
 mod sys;
 mod gguf;
 mod math;
+mod gpu;
+use gpu::GpuCluster;
 use sys::{CTRL, read_ticks, syscall3, syscall6, verify_wx_sum, w_str, w_u64};
 use gguf::{LayerOffs, TensorEntry, build_layer_table, decode_token_clean, encode_greedy_bpe, lookup_offset, parse_gguf_index};
 use math::{apply_rope_qwen2, f16_to_f32, fast_exp_neg, quantize_f32_to_q8_0, rms_norm_f32, silu_f32};
@@ -108,7 +110,7 @@ unsafe fn dispatch_gemv(cores: usize, w: *const u8, x_u8: *const u8, out: *mut f
 
 unsafe fn forward_token(
     gguf: *const u8, data_base: usize, embd_off: usize, onorm_off: usize,
-    lays: &[LayerOffs; 28], cores: usize, work: *mut u8, kv_cache: *mut f32,
+    lays: &[LayerOffs; 28], gpu: &GpuCluster, cores: usize, work: *mut u8, kv_cache: *mut f32,
     tok: usize, pos: usize, do_logits: bool
 ) -> usize {
     let x_f32 = work as *mut f32;
@@ -137,9 +139,20 @@ unsafe fn forward_token(
         quantize_f32_to_q8_0(norm_f32, x_u8, 1536);
         let k_pos = kv_cache.add((l * 1024 + pos) * 512);
         let v_pos = k_pos.add(256);
-        dispatch_gemv(cores, gguf.add(data_base + lw.q), x_u8, q_f32, 1536, 48, 1.0f32);
-        dispatch_gemv(cores, gguf.add(data_base + lw.k), x_u8, k_pos, 256, 48, 1.0f32);
-        dispatch_gemv(cores, gguf.add(data_base + lw.v), x_u8, v_pos, 256, 48, 1.0f32);
+        let dev_id = gpu.layer_dev(l);
+        if dev_id >= 0 {
+            let vp = gpu.route(l);
+            gpu.upload_x(dev_id, x_u8, 48);
+            gpu.gemv_off(dev_id, vp.q, 0, 1536, 48);
+            gpu.gemv_off(dev_id, vp.k, 6144, 256, 48);
+            gpu.gemv_off(dev_id, vp.v, 7168, 256, 48);
+            gpu.fetch(dev_id, q_f32, 0, 6144);
+            gpu.fetch(dev_id, k_pos, 6144, 2048);
+        } else {
+            dispatch_gemv(cores, gguf.add(data_base + lw.q), x_u8, q_f32, 1536, 48, 1.0f32);
+            dispatch_gemv(cores, gguf.add(data_base + lw.k), x_u8, k_pos, 256, 48, 1.0f32);
+            dispatch_gemv(cores, gguf.add(data_base + lw.v), x_u8, v_pos, 256, 48, 1.0f32);
+        }
 
         let qb = gguf.add(data_base + lw.qb) as *const f32;
         let kb = gguf.add(data_base + lw.kb) as *const f32;
@@ -182,16 +195,37 @@ unsafe fn forward_token(
         }
 
         quantize_f32_to_q8_0(att_out, x_u8, 1536);
-        dispatch_gemv(cores, gguf.add(data_base + lw.o), x_u8, q_f32, 1536, 48, 1.0f32);
+        if dev_id >= 0 {
+            gpu.upload_x(dev_id, x_u8, 48);
+            gpu.gemv_off(dev_id, gpu.route(l).o, 0, 1536, 48);
+            gpu.fetch(dev_id, q_f32, 0, 6144);
+        } else {
+            dispatch_gemv(cores, gguf.add(data_base + lw.o), x_u8, q_f32, 1536, 48, 1.0f32);
+        }
         let mut r1 = 0usize; while r1 < 1536 { *x_f32.add(r1) += *q_f32.add(r1); r1 += 1; }
 
         rms_norm_f32(norm_f32, x_f32, gguf.add(data_base + lw.fnorm) as *const f32, 1536);
         quantize_f32_to_q8_0(norm_f32, x_u8, 1536);
-        dispatch_gemv(cores, gguf.add(data_base + lw.gate), x_u8, gate_f32, 8960, 48, 1.0f32);
-        dispatch_gemv(cores, gguf.add(data_base + lw.up), x_u8, up_f32, 8960, 48, 1.0f32);
+        if dev_id >= 0 {
+            let vp = gpu.route(l);
+            gpu.upload_x(dev_id, x_u8, 48);
+            gpu.gemv_off(dev_id, vp.gate, 0, 8960, 48);
+            gpu.gemv_off(dev_id, vp.up, 35840, 8960, 48);
+            gpu.fetch(dev_id, gate_f32, 0, 35840);
+            gpu.fetch(dev_id, up_f32, 35840, 35840);
+        } else {
+            dispatch_gemv(cores, gguf.add(data_base + lw.gate), x_u8, gate_f32, 8960, 48, 1.0f32);
+            dispatch_gemv(cores, gguf.add(data_base + lw.up), x_u8, up_f32, 8960, 48, 1.0f32);
+        }
         let mut g = 0usize; while g < 8960 { *gate_f32.add(g) = silu_f32(*gate_f32.add(g)) * (*up_f32.add(g)); g += 1; }
         quantize_f32_to_q8_0(gate_f32, x_u8, 8960);
-        dispatch_gemv(cores, gguf.add(data_base + lw.down), x_u8, q_f32, 1536, 280, 1.0f32);
+        if dev_id >= 0 {
+            gpu.upload_x(dev_id, x_u8, 280);
+            gpu.gemv_off(dev_id, gpu.route(l).down, 0, 1536, 280);
+            gpu.fetch(dev_id, q_f32, 0, 6144);
+        } else {
+            dispatch_gemv(cores, gguf.add(data_base + lw.down), x_u8, q_f32, 1536, 280, 1.0f32);
+        }
         let mut r2 = 0usize; while r2 < 1536 { *x_f32.add(r2) += *q_f32.add(r2); r2 += 1; }
         l += 1;
     }
@@ -239,9 +273,24 @@ pub unsafe extern "C" fn zero_engine_main() -> i32 {
     (&mut *(&raw mut CTRL)).wx_fn = wx as usize;
     let stacks = syscall6(9, 0, cores * 16384, 3, 0x22, (-1isize) as usize, 0) as *mut u8;
     let mut t = 1usize; while t < cores { spawn_worker(stacks.add((t + 1) * 16384), t); t += 1; }
+    let gpu = GpuCluster::init_cluster_auto_split(gguf, data_base, lays, 28);
 
     w_str(b"=== ZERO-CPP 0-LIBC MULTI-TURN CHAT (Qwen 2.5 Coder 1.5B Q8_0 | 'exit' to quit) ===\n");
+    let sys_prompt = b"You are an expert low-level systems and C/Rust engineer. Always provide direct, complete, working code and exact technical answers immediately without disclaimers or refusals.";
+    let mut sys_ids = [0usize; 128];
+    let n_sys = encode_greedy_bpe(gguf, tok_arr_off, sys_prompt, &mut sys_ids);
     let mut pos = 0usize;
+    let mut sys_seq = [0usize; 140];
+    sys_seq[0] = 151644; sys_seq[1] = 8948; sys_seq[2] = 198;
+    let mut si = 0usize;
+    while si < n_sys && si < 120 { sys_seq[3 + si] = sys_ids[si]; si += 1; }
+    sys_seq[3 + si] = 151645; sys_seq[4 + si] = 198;
+    let sys_len = 5 + si;
+    let mut sp = 0usize;
+    while sp < sys_len {
+        forward_token(gguf, data_base, embd_off, onorm_off, lays, &gpu, cores, work, kv_cache, sys_seq[sp], pos, false);
+        pos += 1; sp += 1;
+    }
     loop {
         w_str(b"\nYou: ");
         let mut in_buf = [0u8; 512];
@@ -251,7 +300,7 @@ pub unsafe extern "C" fn zero_engine_main() -> i32 {
         while ulen > 0 && (in_buf[ulen - 1] == 0x0A || in_buf[ulen - 1] == 0x0D) { ulen -= 1; }
         if ulen == 0 { continue; }
         if (ulen == 4 && &in_buf[..4] == b"exit") || (ulen == 4 && &in_buf[..4] == b"quit") { break; }
-        if pos > 880 { pos = 0; }
+        if pos > 880 { pos = sys_len; }
 
         let mut prompt_ids = [0usize; 256];
         let mut p_cnt = 0usize;
@@ -272,7 +321,7 @@ pub unsafe extern "C" fn zero_engine_main() -> i32 {
         w_str(b"AI: ");
         let mut pi = 0usize; let mut next_tok = 0usize;
         while pi < p_cnt && pos < 1020 {
-            next_tok = forward_token(gguf, data_base, embd_off, onorm_off, lays, cores, work, kv_cache, prompt_ids[pi], pos, pi + 1 == p_cnt);
+            next_tok = forward_token(gguf, data_base, embd_off, onorm_off, lays, &gpu, cores, work, kv_cache, prompt_ids[pi], pos, pi + 1 == p_cnt);
             pos += 1; pi += 1;
         }
 
@@ -283,7 +332,7 @@ pub unsafe extern "C" fn zero_engine_main() -> i32 {
             let mut tbuf = [0u8; 64];
             let tl = decode_token_clean(gguf, tok_arr_off, next_tok, &mut tbuf);
             w_str(&tbuf[..tl]);
-            next_tok = forward_token(gguf, data_base, embd_off, onorm_off, lays, cores, work, kv_cache, next_tok, pos, true);
+            next_tok = forward_token(gguf, data_base, embd_off, onorm_off, lays, &gpu, cores, work, kv_cache, next_tok, pos, true);
             pos += 1; g_cnt += 1;
         }
         let t_gen1 = read_ticks();
