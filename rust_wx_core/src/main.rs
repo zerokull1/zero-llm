@@ -98,8 +98,7 @@ extern "C" fn worker_loop(tid: usize) -> ! {
             if unsafe { (*(&raw const CTRL)).stop.load(Ordering::Acquire) } != 0 {
                 unsafe { asm!("mov eax, 60", "xor edi, edi", "syscall", options(noreturn)); }
             }
-            let mut sp = 0u32; while sp < 64 { core::hint::spin_loop(); sp += 1; }
-            unsafe { let _ = syscall3(24, 0, 0, 0); }
+            unsafe { let _ = syscall6(202, (&raw const (*(&raw const CTRL)).epoch) as usize, 128, local_ep as u32 as usize, 0, 0, 0); }
             ep = unsafe { (*(&raw const CTRL)).epoch.load(Ordering::Acquire) };
         }
         local_ep = ep;
@@ -139,6 +138,7 @@ unsafe fn dispatch_gemv(cores: usize, w: *const u8, gtype: u32, x_u8: *const u8,
     let ep = *(&raw const EPOCH_SEQ) + 1;
     *(&raw mut EPOCH_SEQ) = ep;
     ctrl.epoch.store(ep, Ordering::Release);
+    let _ = syscall6(202, (&raw const ctrl.epoch) as usize, 129, 8, 0, 0, 0);
     let kern: unsafe extern "C" fn(*const u8, *const u8, usize) -> f32 = core::mem::transmute(k_ptr);
     let mut r = 0usize; let mut bid = 0usize; let mut blog = -1e30f32;
     while r < rpc {
@@ -407,6 +407,7 @@ pub unsafe extern "C" fn zero_engine_main(argc: usize, argv: *const *const u8) -
     }
     }
     (&mut *(&raw mut CTRL)).stop.store(1, Ordering::Release);
+    let _ = syscall6(202, (&raw const (*(&raw const CTRL)).epoch) as usize, 129, 8, 0, 0, 0);
     if syscall3(10, wx as usize, 4096, 3) == 0 {
         let mut z = 0; while z < len { wx.add(z).write_volatile(0); z += 1; }
         fence(Ordering::SeqCst); let _ = syscall3(10, wx as usize, 4096, 0);
