@@ -135,7 +135,7 @@ unsafe fn forward_token(
         let lw = &lays[l];
         rms_norm_f32(norm_f32, x_f32, gguf.add(data_base + lw.anorm) as *const f32, 1536);
         quantize_f32_to_q8_0(norm_f32, x_u8, 1536);
-        let k_pos = kv_cache.add((l * 128 + pos) * 512);
+        let k_pos = kv_cache.add((l * 1024 + pos) * 512);
         let v_pos = k_pos.add(256);
         dispatch_gemv(cores, gguf.add(data_base + lw.q), x_u8, q_f32, 1536, 48, 1.0f32);
         dispatch_gemv(cores, gguf.add(data_base + lw.k), x_u8, k_pos, 256, 48, 1.0f32);
@@ -157,7 +157,7 @@ unsafe fn forward_token(
             let mut max_s = -1e30f32;
             let mut t = 0usize;
             while t <= pos {
-                let kh = kv_cache.add((l * 128 + t) * 512 + kvh * 128);
+                let kh = kv_cache.add((l * 1024 + t) * 512 + kvh * 128);
                 let mut dot = 0.0f32; let mut d = 0usize;
                 while d < 128 { dot += (*qh.add(d)) * (*kh.add(d)); d += 1; }
                 dot *= 0.08838835f32;
@@ -174,7 +174,7 @@ unsafe fn forward_token(
             let mut t3 = 0usize;
             while t3 <= pos {
                 let w_att = *scores.add(t3) * inv_e;
-                let vh = kv_cache.add((l * 128 + t3) * 512 + 256 + kvh * 128);
+                let vh = kv_cache.add((l * 1024 + t3) * 512 + 256 + kvh * 128);
                 let mut d1 = 0usize; while d1 < 128 { *oh.add(d1) += w_att * (*vh.add(d1)); d1 += 1; }
                 t3 += 1;
             }
@@ -235,55 +235,70 @@ pub unsafe extern "C" fn zero_engine_main() -> i32 {
     build_layer_table(tbl, t_cnt, lays);
 
     let work = syscall6(9, 0, 131072, 3, 0x22, (-1isize) as usize, 0) as *mut u8;
-    let kv_cache = syscall6(9, 0, 28 * 128 * 512 * 4, 3, 0x22, (-1isize) as usize, 0) as *mut f32;
+    let kv_cache = syscall6(9, 0, 28 * 1024 * 512 * 4, 3, 0x22, (-1isize) as usize, 0) as *mut f32;
     (&mut *(&raw mut CTRL)).wx_fn = wx as usize;
     let stacks = syscall6(9, 0, cores * 16384, 3, 0x22, (-1isize) as usize, 0) as *mut u8;
     let mut t = 1usize; while t < cores { spawn_worker(stacks.add((t + 1) * 16384), t); t += 1; }
 
-    w_str(b"=== ZERO-CPP 0-LIBC CHAT (Qwen 2.5 Coder 1.5B Q8_0) ===\nYou: ");
-    let mut in_buf = [0u8; 256];
-    let n_in = syscall3(0, 0, in_buf.as_mut_ptr() as usize, 250);
-    let ulen = if n_in > 0 { n_in as usize } else { 0 };
+    w_str(b"=== ZERO-CPP 0-LIBC MULTI-TURN CHAT (Qwen 2.5 Coder 1.5B Q8_0 | 'exit' to quit) ===\n");
+    let mut pos = 0usize;
+    loop {
+        w_str(b"\nYou: ");
+        let mut in_buf = [0u8; 512];
+        let n_in = syscall3(0, 0, in_buf.as_mut_ptr() as usize, 500);
+        if n_in <= 0 { break; }
+        let mut ulen = n_in as usize;
+        while ulen > 0 && (in_buf[ulen - 1] == 0x0A || in_buf[ulen - 1] == 0x0D) { ulen -= 1; }
+        if ulen == 0 { continue; }
+        if (ulen == 4 && &in_buf[..4] == b"exit") || (ulen == 4 && &in_buf[..4] == b"quit") { break; }
+        if pos > 880 { pos = 0; }
 
-    let mut prompt_ids = [0usize; 128];
-    prompt_ids[0] = 151644; prompt_ids[1] = 872; prompt_ids[2] = 198;
-    let mut enc_ids = [0usize; 128];
-    let n_enc = encode_greedy_bpe(gguf, tok_arr_off, &in_buf[..ulen], &mut enc_ids);
-    let mut p_cnt = 3usize;
-    let mut e = 0usize;
-    while e < n_enc && p_cnt < 100 { prompt_ids[p_cnt] = enc_ids[e]; p_cnt += 1; e += 1; }
-    prompt_ids[p_cnt] = 151645; p_cnt += 1; prompt_ids[p_cnt] = 198; p_cnt += 1;
-    prompt_ids[p_cnt] = 151644; p_cnt += 1; prompt_ids[p_cnt] = 77091; p_cnt += 1; prompt_ids[p_cnt] = 198; p_cnt += 1;
+        let mut prompt_ids = [0usize; 256];
+        let mut p_cnt = 0usize;
+        if pos > 0 { prompt_ids[p_cnt] = 198; p_cnt += 1; }
+        prompt_ids[p_cnt] = 151644; p_cnt += 1;
+        prompt_ids[p_cnt] = 872;    p_cnt += 1;
+        prompt_ids[p_cnt] = 198;    p_cnt += 1;
+        let mut enc_ids = [0usize; 128];
+        let n_enc = encode_greedy_bpe(gguf, tok_arr_off, &in_buf[..ulen], &mut enc_ids);
+        let mut e = 0usize;
+        while e < n_enc && p_cnt < 240 { prompt_ids[p_cnt] = enc_ids[e]; p_cnt += 1; e += 1; }
+        prompt_ids[p_cnt] = 151645; p_cnt += 1;
+        prompt_ids[p_cnt] = 198;    p_cnt += 1;
+        prompt_ids[p_cnt] = 151644; p_cnt += 1;
+        prompt_ids[p_cnt] = 77091;  p_cnt += 1;
+        prompt_ids[p_cnt] = 198;    p_cnt += 1;
 
-    w_str(b"AI: ");
-    let mut pos = 0usize; let mut next_tok = 0usize;
-    while pos < p_cnt {
-        next_tok = forward_token(gguf, data_base, embd_off, onorm_off, lays, cores, work, kv_cache, prompt_ids[pos], pos, pos + 1 == p_cnt);
-        pos += 1;
+        w_str(b"AI: ");
+        let mut pi = 0usize; let mut next_tok = 0usize;
+        while pi < p_cnt && pos < 1020 {
+            next_tok = forward_token(gguf, data_base, embd_off, onorm_off, lays, cores, work, kv_cache, prompt_ids[pi], pos, pi + 1 == p_cnt);
+            pos += 1; pi += 1;
+        }
+
+        let t_gen0 = read_ticks();
+        let mut g_cnt = 0usize;
+        while g_cnt < 256 && pos < 1020 {
+            if next_tok == 151645 || next_tok == 151643 { break; }
+            let mut tbuf = [0u8; 64];
+            let tl = decode_token_clean(gguf, tok_arr_off, next_tok, &mut tbuf);
+            w_str(&tbuf[..tl]);
+            next_tok = forward_token(gguf, data_base, embd_off, onorm_off, lays, cores, work, kv_cache, next_tok, pos, true);
+            pos += 1; g_cnt += 1;
+        }
+        let t_gen1 = read_ticks();
+        w_str(b"\n[TOKENS="); w_u64(g_cnt as u64);
+        w_str(b" | CTX_POS="); w_u64(pos as u64);
+        w_str(b" | CYCLES="); w_u64(t_gen1.wrapping_sub(t_gen0)); w_str(b"]\n");
     }
-
-    let t_gen0 = read_ticks();
-    let mut g_cnt = 0usize;
-    while g_cnt < 115 && pos < 127 {
-        if next_tok == 151645 || next_tok == 151643 { break; }
-        let mut tbuf = [0u8; 64];
-        let tl = decode_token_clean(gguf, tok_arr_off, next_tok, &mut tbuf);
-        w_str(&tbuf[..tl]);
-        next_tok = forward_token(gguf, data_base, embd_off, onorm_off, lays, cores, work, kv_cache, next_tok, pos, true);
-        pos += 1;
-        g_cnt += 1;
-    }
-    let t_gen1 = read_ticks();
     (&mut *(&raw mut CTRL)).stop.store(1, Ordering::Release);
 
-    w_str(b"\n[TOKENS="); w_u64(g_cnt as u64);
-    w_str(b" | TOTAL_CYCLES="); w_u64(t_gen1.wrapping_sub(t_gen0)); w_str(b"]\n");
 
     if syscall3(10, wx as usize, 4096, 3) == 0 {
         let mut z = 0; while z < len { wx.add(z).write_volatile(0); z += 1; }
         fence(Ordering::SeqCst); let _ = syscall3(10, wx as usize, 4096, 0);
     }
-    let _ = syscall3(11, kv_cache as usize, 28 * 128 * 512 * 4, 0);
+    let _ = syscall3(11, kv_cache as usize, 28 * 1024 * 512 * 4, 0);
     let _ = syscall3(11, work as usize, 131072, 0);
     let _ = syscall3(11, gguf as usize, fsize, 0);
     let _ = syscall3(11, arena as usize, 12288, 0);
