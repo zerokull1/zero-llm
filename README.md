@@ -48,3 +48,7 @@ readelf -p .rodata build/zero-wx-core | grep WATERMARK
 ```
 
 Licensed under **GNU AGPL-3.0** (`LICENSE` and `NOTICE`). Original Author & Architect: **zerokull1**.
+
+## Security & Adversarial Hardening (25.11.2026)
+- **Zero-Crash GGUF & Tokenizer Parser (`src/gguf.rs`)**: Saturating bounds validation (`flen`) across all KV headers, tensor descriptors, and BPE strings; zero-head `SIGFPE` prevention; `usize::MAX` sentinel eliminating `offset=0` collisions.
+- **Hardware & Bus Integrity (`src/gpu.rs`, `src/sys.rs`, `src/main.rs`)**: Non-null symbol verification before Vulkan FFI dispatch, TOCTOU-free `TokamakBus` (`0x88B5`) length validation, and mapped-memory syscall structures.
