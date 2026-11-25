@@ -57,12 +57,14 @@ Licensed under **GNU AGPL-3.0** (`LICENSE` and `NOTICE`). Original Author & Arch
 - **VT-d IOMMU & TokamakBus Protection**: Enforced `intel_iommu=on iommu=force` (`DMAR` isolated PCIe groups) and `mei_me` driver removal so external PCIe controllers cannot perform unauthorized Bus Master DMA into `TokamakBus` (`0x88B5`) or GGUF weight pages.
 - **Isolated Data-Center Deployment**: Protected at host boundary by Pre-OS UEFI network shutdown, `VT-d` IOMMU DMA isolation, and East-West rack quarantine.
 - **58-Vector Host & Perimeter Isolation**: Protected by `VT-d` IOMMU DMA isolation, `TokamakBus`, and 58-vector XDP/L7/tarpit perimeter defenses.
-- **68-Vector Host & Perimeter Isolation**: Protected by `VT-d` IOMMU DMA isolation, `TokamakBus`, and 68-vector XDP/L7/tarpit/pulse-barrier perimeter defenses.
-- **68-Vector Host & Silicon Cache Isolation**: Protected by `VT-d` IOMMU DMA isolation, `TokamakBus`, and 68-vector XDP/L7/tarpit/Core #3 L1d canary defenses.
+- **73-Vector Host & Perimeter Isolation**: Protected by `VT-d` IOMMU DMA isolation, `TokamakBus`, and 73-vector XDP/L7/tarpit/pulse-barrier perimeter defenses.
+- **73-Vector Host & Silicon Cache Isolation**: Protected by `VT-d` IOMMU DMA isolation, `TokamakBus`, and 73-vector XDP/L7/tarpit/Core #3 L1d canary defenses.
 
-- **Hardware-Calibrated Master Pulse & 68-Vector Continuum**: Host timing anchored to UEFI `HardwarePulseAnchor` with `VT-d` IOMMU DMA isolation and **68 audited perimeter/kernel vectors**.
+- **Hardware-Calibrated Master Pulse & 73-Vector Continuum**: Host timing anchored to UEFI `HardwarePulseAnchor` with `VT-d` IOMMU DMA isolation and **73 audited perimeter/kernel vectors**.
+
+- **73-Vector Host, Kernel & Watchdog Isolation**: Protected by `VT-d` IOMMU DMA isolation, `zero_timing_ring0`, zero-allocation `zero-host-guard` (`/proc/[pid]/exe`), and **73 audited perimeter vectors**.
 
 ## Roadmap
-- **Phase 1 [Done]:** Hardened GGUF parser + `VT-d` IOMMU DMA isolation + 68-vector host boundary.
+- **Phase 1 [Done]:** Hardened GGUF parser + `VT-d` IOMMU DMA isolation + 73-vector host boundary.
 - **Phase 2–4 [Next]:** Zero-copy telemetry summarization from `TokamakBus` & dedicated CPU inference pinning after SmartNIC XDP offload.
-- **68-Vector Host, Kernel Ring-0 & Silicon Isolation**: Protected by `VT-d` IOMMU DMA isolation, `zero_timing_ring0` `ENFORCE` kernel hook, `TokamakBus`, and 68-vector XDP/L7 defenses.
+- **73-Vector Host, Kernel Ring-0 & Silicon Isolation**: Protected by `VT-d` IOMMU DMA isolation, `zero_timing_ring0` `ENFORCE` kernel hook, `TokamakBus`, and 73-vector XDP/L7 defenses.
