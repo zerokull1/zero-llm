@@ -107,9 +107,18 @@ pub unsafe fn decode_token_clean(base: *const u8, tok_arr_off: usize, target_id:
     let src = base.add(off + 8);
     let mut s = 0usize; let mut d = 0usize;
     while s < sl && d < 62 {
-        if s + 1 < sl && *src.add(s) == 0xC4 && *src.add(s + 1) == 0xA0 { out[d] = b' '; d += 1; s += 2; }
-        else if s + 1 < sl && *src.add(s) == 0xC4 && *src.add(s + 1) == 0x8A { out[d] = 0x0A; d += 1; s += 2; }
-        else { out[d] = *src.add(s); d += 1; s += 1; }
+        let b0 = *src.add(s);
+        if s + 1 < sl && b0 == 0xC4 {
+            let b1 = *src.add(s + 1);
+            if b1 == 0xA0 { out[d] = b' '; d += 1; }
+            else if b1 == 0x8A { out[d] = 0x0A; d += 1; }
+            else if b1 >= 0x80 && b1 <= 0xA0 && b1 != 0x8D { out[d] = b1; d += 1; }
+            s += 2;
+        } else if s + 1 < sl && (b0 == 0xC2 || b0 == 0xC3) {
+            let b1 = *src.add(s + 1);
+            out[d] = if b0 == 0xC2 { b1 } else { b1 + 0x40 };
+            d += 1; s += 2;
+        } else { out[d] = b0; d += 1; s += 1; }
     }
     d
 }
@@ -118,10 +127,13 @@ pub unsafe fn encode_greedy_bpe(base: *const u8, tok_arr_off: usize, text: &[u8]
     let mut norm = [0u8; 256];
     let mut nlen = 0usize;
     let mut i = 0usize;
-    while i < text.len() && nlen < 252 {
-        if text[i] == b' ' { norm[nlen] = 0xC4; norm[nlen + 1] = 0xA0; nlen += 2; }
-        else if text[i] == 0x0A { norm[nlen] = 0xC4; norm[nlen + 1] = 0x8A; nlen += 2; }
-        else if text[i] != 0x0D { norm[nlen] = text[i]; nlen += 1; }
+    while i < text.len() && nlen < 250 {
+        let b = text[i];
+        if b == b' ' { norm[nlen] = 0xC4; norm[nlen + 1] = 0xA0; nlen += 2; }
+        else if b == 0x0A { norm[nlen] = 0xC4; norm[nlen + 1] = 0x8A; nlen += 2; }
+        else if b >= 0x80 && b <= 0xA0 { norm[nlen] = 0xC4; norm[nlen + 1] = b; nlen += 2; }
+        else if b >= 0xA1 { norm[nlen] = if b < 0xC0 { 0xC2 } else { 0xC3 }; norm[nlen + 1] = if b < 0xC0 { b } else { b - 0x40 }; nlen += 2; }
+        else if b != 0x0D { norm[nlen] = b; nlen += 1; }
         i += 1;
     }
     let al = (base.add(tok_arr_off + 4) as *const u64).read_unaligned() as usize;
