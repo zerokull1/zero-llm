@@ -58,3 +58,4 @@ Licensed under **GNU AGPL-3.0** (`LICENSE` and `NOTICE`). Original Author & Arch
 - **Isolated Data-Center Deployment**: Protected at host boundary by Pre-OS UEFI network shutdown, `VT-d` IOMMU DMA isolation, and East-West rack quarantine.
 - **58-Vector Host & Perimeter Isolation**: Protected by `VT-d` IOMMU DMA isolation, `TokamakBus`, and 58-vector XDP/L7/tarpit perimeter defenses.
 - **64-Vector Host & Perimeter Isolation**: Protected by `VT-d` IOMMU DMA isolation, `TokamakBus`, and 64-vector XDP/L7/tarpit/pulse-barrier perimeter defenses.
+- **64-Vector Host & Silicon Cache Isolation**: Protected by `VT-d` IOMMU DMA isolation, `TokamakBus`, and 64-vector XDP/L7/tarpit/Core #3 L1d canary defenses.
