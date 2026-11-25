@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 zerokull1 (https://github.com)
 #[inline(always)]
 pub fn f16_to_f32(h: u16) -> f32 {
     let s = ((h & 0x8000) as u32) << 16;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 zerokull1 (https://github.com)
 #![allow(unsafe_op_in_unsafe_fn)]
 #![no_std]
 #![no_main]

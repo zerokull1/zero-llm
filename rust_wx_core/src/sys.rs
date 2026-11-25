@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 zerokull1 (https://github.com)
 use core::arch::asm;
 use core::sync::atomic::{AtomicU32, AtomicU64};
 
@@ -87,3 +89,7 @@ pub unsafe fn tokamak_bus_verify(bus: &mut TokamakBus) -> bool {
     }
     true
 }
+
+#[used]
+#[unsafe(link_section = ".rodata")]
+pub static AUTHOR_WATERMARK: [u8; 111] = *b"ZERO-LLM-WATERMARK::AUTHOR=zerokull1::ARCH=TOKAMAK-L1I-WX-0LIBC::ETHER=0x88B5::YEAR=2026::SIG=5A45524F4C4C4D31\0";

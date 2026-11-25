@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 zerokull1 (https://github.com)
 #[derive(Clone, Copy)]
 pub struct TensorEntry { pub hash: u64, pub offset: u64, pub gtype: u32 }
 

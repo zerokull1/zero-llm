@@ -1,2 +1,7 @@
+build/
+rust_wx_core/build/
 zero-llm
 *.o
+*.so
+*.gguf
+.DS_Store

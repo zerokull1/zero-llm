@@ -1,0 +1,12 @@
+zero-llm (Tokamak Compute Core & 0-Libc W^X Inference Engine)
+Copyright (c) 2026 zerokull1 (https://github.com)
+
+Original Author & Architect: zerokull1
+Architecture: L1i-Resident Tokamak Core, W^X Runtime Kernel Arena,
+Zero-Libc Rust/ASM Engine (rust_wx_core), Lock-Free /dev/shm/zero_llm_bus,
+and Inter-Rack XDP EtherType 0x88B5 Wire Sync.
+
+Under GNU AGPL-3.0, any modified version, binary distribution, or
+network/rack service deployment MUST retain this NOTICE and original
+author attribution (zerokull1) and make the complete corresponding
+source code publicly available.

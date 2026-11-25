@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) 2026 zerokull1 (https://github.com)
 use crate::gguf::{LayerOffs, ModelCfg};
 use crate::sys::{syscall6,w_str,w_u64};
 use core::ffi::c_void;
