@@ -1,4 +1,4 @@
-use crate::gguf::LayerOffs;
+use crate::gguf::{LayerOffs, ModelCfg};
 use crate::sys::{syscall6,w_str,w_u64};
 use core::ffi::c_void;
 
@@ -81,7 +81,8 @@ pub unsafe fn probe_vulkan_devices() -> u32 {
 
 impl GpuCluster {
     #[inline(never)]
-    pub unsafe fn init_cluster_auto_split(gguf: *const u8,data_base: usize,lays: &[LayerOffs;28],total_layers: usize) -> Self {
+    pub unsafe fn init_cluster_auto_split(gguf: *const u8,data_base: usize,lays: &[LayerOffs;64],cfg: &ModelCfg) -> Self {
+        let total_layers = cfg.n_layers;
         let vk_cnt = probe_vulkan_devices();
         let routes_bytes = (total_layers * core::mem::size_of::<LayerGpuRoute>() + 4095) & !4095;
         let routes = syscall6(9,0,routes_bytes,3,0x22,(-1isize) as usize,0) as *mut LayerGpuRoute;
@@ -116,7 +117,8 @@ impl GpuCluster {
         let n_devs = if (cnt as usize) > MAX_GPUS { MAX_GPUS } else { cnt as usize };
         let devs_bytes = (n_devs * core::mem::size_of::<GpuDeviceSlot>() + 4095) & !4095;
         cl.devs = syscall6(9,0,devs_bytes,3,0x22,(-1isize) as usize,0) as *mut GpuDeviceSlot;
-        const LAYER_BYTES: usize = 49_717_248;
+        let hb = cfg.hidden >> 5; let fb = cfg.ffn >> 5; let kv_dim = (cfg.hidden / cfg.n_heads) * cfg.n_kv_heads;
+        let layer_bytes = (2 * cfg.hidden * hb + 2 * kv_dim * hb + 2 * cfg.ffn * hb + cfg.hidden * fb) * 34;
         let mut next_layer = 0usize;
         let mut g = 0usize;
         while g < n_devs && next_layer < total_layers {
@@ -124,14 +126,14 @@ impl GpuCluster {
             if cu_dev_get(&mut dev,g as i32) == 0 && cu_ctx_create(&mut ctx,0,dev) == 0 && !ctx.is_null() {
                 let mut free_b = 0usize;let mut tot_b = 0usize;
                 let _ = cu_mem_info(&mut free_b,&mut tot_b);
-                let mut can_fit = free_b.saturating_sub(144 * 1024 * 1024) / LAYER_BYTES;
+                let mut can_fit = free_b.saturating_sub(320 * 1024 * 1024) / layer_bytes;
                 if can_fit > total_layers - next_layer { can_fit = total_layers - next_layer;}
                 let mut ptx_mod: *mut c_void = core::ptr::null_mut();let mut kern_fn: *mut c_void = core::ptr::null_mut();
                 let mut d_x = 0u64;let mut d_out = 0u64;
                 if can_fit > 0
                     && cu_mod_load(&mut ptx_mod,PTX_HEAD.as_ptr() as *const c_void) == 0
                     && cu_mod_fn(&mut kern_fn,ptx_mod,b"q8_gemv_dp4a\0".as_ptr()) == 0
-                    && cu_mem_alloc(&mut d_x,280 * 36) == 0 && cu_mem_alloc(&mut d_out,8960 * 8) == 0
+                    && cu_mem_alloc(&mut d_x,(if fb > hb { fb } else { hb }) * 36) == 0 && cu_mem_alloc(&mut d_out,(if cfg.ffn > cfg.hidden { cfg.ffn } else { cfg.hidden }) * 8) == 0
                 {
                     *cl.devs.add(cl.num_gpus) = GpuDeviceSlot { ctx,kern_fn,d_x_q8: d_x,d_out_f32: d_out };
                     let gpu_idx = cl.num_gpus as i32;
@@ -141,18 +143,19 @@ impl GpuCluster {
                         let lw = &lays[next_layer];
                         let mut r = LayerGpuRoute { dev_id: gpu_idx,q:0,k:0,v:0,o:0,gate:0,up:0,down:0 };
                         let pairs: [(&mut u64,usize,usize);7] = [
-                            (&mut r.q,lw.q,1536*48*34),(&mut r.k,lw.k,256*48*34),(&mut r.v,lw.v,256*48*34),
-                            (&mut r.o,lw.o,1536*48*34),(&mut r.gate,lw.gate,8960*48*34),(&mut r.up,lw.up,8960*48*34),
-                            (&mut r.down,lw.down,1536*280*34),
+                            (&mut r.q,lw.q,cfg.hidden*hb*34),(&mut r.k,lw.k,kv_dim*hb*34),(&mut r.v,lw.v,kv_dim*hb*34),
+                            (&mut r.o,lw.o,cfg.hidden*hb*34),(&mut r.gate,lw.gate,cfg.ffn*hb*34),(&mut r.up,lw.up,cfg.ffn*hb*34),
+                            (&mut r.down,lw.down,cfg.hidden*fb*34),
                         ];
                         let mut ok = true;
                         for (dp,off,sz) in pairs {
                             if cu_mem_alloc(dp,sz) != 0 { ok = false;break;}
-                            let _ = htod(*dp,gguf.add(data_base + off) as *const c_void,sz);
+                            let src_p = gguf.add(data_base + off); let mut pg = 0usize; while pg < sz { let _ = src_p.add(pg).read_volatile(); pg += 4096; }
+                            if htod(*dp,src_p as *const c_void,sz) != 0 { ok = false; break; }
                         }
                         if !ok { break;}
                         *routes.add(next_layer) = r;
-                        next_layer += 1;cl.gpu_layers += 1;cl.total_vram_used_mb += LAYER_BYTES / (1024 * 1024);k += 1;
+                        next_layer += 1;cl.gpu_layers += 1;cl.total_vram_used_mb += layer_bytes / (1024 * 1024);k += 1;
                     }
                     cl.num_gpus += 1;
                 }

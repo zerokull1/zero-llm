@@ -8,11 +8,38 @@ pub struct LayerOffs {
     pub fnorm: usize, pub gate: usize, pub up: usize, pub down: usize,
 }
 
+#[derive(Clone, Copy)]
+pub struct ModelCfg {
+    pub n_layers: usize,
+    pub hidden: usize,
+    pub ffn: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub vocab: usize,
+    pub rope_theta: f32,
+}
+
 pub fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     let mut i = 0;
     while i < bytes.len() { h ^= bytes[i] as u64; h = h.wrapping_mul(0x100000001b3); i += 1; }
     h
+}
+
+fn ends_with(k: &[u8], sfx: &[u8]) -> bool {
+    if k.len() < sfx.len() { return false; }
+    let off = k.len() - sfx.len();
+    let mut i = 0;
+    while i < sfx.len() { if k[off + i] != sfx[i] { return false; } i += 1; }
+    true
+}
+
+unsafe fn read_kv_u32(p: *const u8, off: usize, vt: u32) -> usize {
+    match vt {
+        4 | 5 => (p.add(off) as *const u32).read_unaligned() as usize,
+        10 | 11 => (p.add(off) as *const u64).read_unaligned() as usize,
+        _ => 0,
+    }
 }
 
 unsafe fn skip_kv_val(p: *const u8, mut off: usize, vtype: u32) -> usize {
@@ -30,7 +57,8 @@ unsafe fn skip_kv_val(p: *const u8, mut off: usize, vtype: u32) -> usize {
     }
 }
 
-pub unsafe fn parse_gguf_index(base: *const u8, table: &mut [TensorEntry; 384]) -> (usize, usize, usize) {
+pub unsafe fn parse_gguf_index(base: *const u8, table: &mut [TensorEntry; 768], cfg: &mut ModelCfg) -> (usize, usize, usize) {
+    *cfg = ModelCfg { n_layers: 28, hidden: 1536, ffn: 8960, n_heads: 12, n_kv_heads: 2, vocab: 151936, rope_theta: 1_000_000.0 };
     let n_tensors = (base.add(8) as *const u64).read_unaligned() as usize;
     let n_kv = (base.add(16) as *const u64).read_unaligned() as usize;
     let mut off = 24usize;
@@ -39,14 +67,26 @@ pub unsafe fn parse_gguf_index(base: *const u8, table: &mut [TensorEntry; 384]) 
     let mut i = 0;
     while i < n_kv {
         let kl = (base.add(off) as *const u64).read_unaligned() as usize;
-        let kh = fnv1a_64(core::slice::from_raw_parts(base.add(off + 8), kl));
+        let kslice = core::slice::from_raw_parts(base.add(off + 8), kl);
+        let kh = fnv1a_64(kslice);
         off += 8 + kl;
         let vt = (base.add(off) as *const u32).read_unaligned();
-        if kh == th && vt == 9 { tok_arr_off = off + 4; }
-        off = skip_kv_val(base, off + 4, vt);
+        let voff = off + 4;
+        if kh == th && vt == 9 {
+            tok_arr_off = voff;
+            cfg.vocab = (base.add(voff + 4) as *const u64).read_unaligned() as usize;
+        } else if ends_with(kslice, b".block_count") { cfg.n_layers = read_kv_u32(base, voff, vt); }
+        else if ends_with(kslice, b".embedding_length") { cfg.hidden = read_kv_u32(base, voff, vt); }
+        else if ends_with(kslice, b".feed_forward_length") { cfg.ffn = read_kv_u32(base, voff, vt); }
+        else if ends_with(kslice, b".attention.head_count") { cfg.n_heads = read_kv_u32(base, voff, vt); }
+        else if ends_with(kslice, b".attention.head_count_kv") { cfg.n_kv_heads = read_kv_u32(base, voff, vt); }
+        else if ends_with(kslice, b".rope.freq_base") && vt == 6 {
+            cfg.rope_theta = f32::from_bits((base.add(voff) as *const u32).read_unaligned());
+        }
+        off = skip_kv_val(base, voff, vt);
         i += 1;
     }
-    let lim = if n_tensors < 384 { n_tensors } else { 384 };
+    let lim = if n_tensors < 768 { n_tensors } else { 768 };
     let mut t = 0;
     while t < lim {
         let nl = (base.add(off) as *const u64).read_unaligned() as usize;
@@ -61,14 +101,14 @@ pub unsafe fn parse_gguf_index(base: *const u8, table: &mut [TensorEntry; 384]) 
     (lim, (off + 31) & !31usize, tok_arr_off)
 }
 
-pub fn lookup_offset(table: &[TensorEntry; 384], count: usize, name: &[u8]) -> usize {
+pub fn lookup_offset(table: &[TensorEntry; 768], count: usize, name: &[u8]) -> usize {
     let h = fnv1a_64(name);
     let mut i = 0;
     while i < count { if table[i].hash == h { return table[i].offset as usize; } i += 1; }
     0
 }
 
-pub fn lookup_layer(table: &[TensorEntry; 384], count: usize, layer: usize, sfx: &[u8]) -> usize {
+pub fn lookup_layer(table: &[TensorEntry; 768], count: usize, layer: usize, sfx: &[u8]) -> usize {
     let mut b = [0u8; 64];
     b[0] = b'b'; b[1] = b'l'; b[2] = b'k'; b[3] = b'.';
     let mut n = 4usize;
@@ -78,9 +118,9 @@ pub fn lookup_layer(table: &[TensorEntry; 384], count: usize, layer: usize, sfx:
     lookup_offset(table, count, &b[..n])
 }
 
-pub fn build_layer_table(t: &[TensorEntry; 384], c: usize, l: &mut [LayerOffs; 28]) {
+pub fn build_layer_table(t: &[TensorEntry; 768], c: usize, n_layers: usize, l: &mut [LayerOffs; 64]) {
     let mut i = 0;
-    while i < 28 {
+    while i < n_layers && i < 64 {
         l[i] = LayerOffs {
             anorm: lookup_layer(t, c, i, b".attn_norm.weight"),
             q: lookup_layer(t, c, i, b".attn_q.weight"), qb: lookup_layer(t, c, i, b".attn_q.bias"),
@@ -116,23 +156,15 @@ pub unsafe fn decode_token_clean(base: *const u8, tok_arr_off: usize, target_id:
             else if cp >= 0x121 && cp <= 0x142 { out[d] = (cp - 0xA2) as u8; d += 1; }
             else if cp == 0x143 { out[d] = 0xAD; d += 1; }
             s += 2;
-        } else if s + 1 < sl && b0 == 0xC2 {
-            out[d] = *src.add(s + 1);
-            d += 1; s += 2;
-        } else if s + 1 < sl && b0 == 0xC3 {
-            out[d] = *src.add(s + 1) + 0x40;
-            d += 1; s += 2;
-        } else {
-            out[d] = b0; d += 1; s += 1;
-        }
+        } else if s + 1 < sl && b0 == 0xC2 { out[d] = *src.add(s + 1); d += 1; s += 2; }
+        else if s + 1 < sl && b0 == 0xC3 { out[d] = *src.add(s + 1) + 0x40; d += 1; s += 2; }
+        else { out[d] = b0; d += 1; s += 1; }
     }
     d
 }
 
 pub unsafe fn encode_greedy_bpe(base: *const u8, tok_arr_off: usize, text: &[u8], out_ids: &mut [usize; 128]) -> usize {
-    let mut norm = [0u8; 256];
-    let mut nlen = 0usize;
-    let mut i = 0usize;
+    let mut norm = [0u8; 256]; let mut nlen = 0usize; let mut i = 0usize;
     while i < text.len() && nlen < 250 {
         let b = text[i];
         if b == b' ' { norm[nlen] = 0xC4; norm[nlen + 1] = 0xA0; nlen += 2; }
@@ -149,20 +181,17 @@ pub unsafe fn encode_greedy_bpe(base: *const u8, tok_arr_off: usize, text: &[u8]
     let al = (base.add(tok_arr_off + 4) as *const u64).read_unaligned() as usize;
     let scan_lim = if al < 151643 { al } else { 151643 };
     let mut pos = 0usize; let mut cnt = 0usize;
-    while pos < nlen && cnt < 120 {
+    while pos < nlen && cnt < 128 {
         let mut best_id = 0usize; let mut best_len = 0usize;
-        let mut off = tok_arr_off + 12;
-        let mut id = 0usize;
-        while id < scan_lim {
+        let mut off = tok_arr_off + 12; let mut tid = 0usize;
+        while tid < scan_lim {
             let sl = (base.add(off) as *const u64).read_unaligned() as usize;
             if sl > best_len && pos + sl <= nlen {
-                let sp = base.add(off + 8);
-                let mut m = 0usize;
+                let sp = base.add(off + 8); let mut m = 0usize;
                 while m < sl && *sp.add(m) == norm[pos + m] { m += 1; }
-                if m == sl { best_len = sl; best_id = id; }
+                if m == sl { best_len = sl; best_id = tid; }
             }
-            off += 8 + sl;
-            id += 1;
+            off += 8 + sl; tid += 1;
         }
         if best_len == 0 { pos += 1; } else { out_ids[cnt] = best_id; cnt += 1; pos += best_len; }
     }
