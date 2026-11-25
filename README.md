@@ -28,3 +28,10 @@ Zero-`libc` (`#![no_std]`, `#![no_main]`, `-nodefaultlibs`) Multi-ISA inference 
 
 - **L1i Footprint:** `11 264 B` `.text` (`34.3%` of 32 KB L1i).
 - **Throughput:** `284.6M` cycles (`~86.2 ms` / `~11.6 full tok/s` across all 28 layers x 7 projections + `151,936`-vocab `LM Head Argmax` = `1.54B` `Q8_0` params/token on 4-core Haswell `i5-4590` DDR3 — `4.66x` faster than the early `2.49 tok/s` probe).
+
+## Standalone 0-Dependency Rust + Raw ASM W^X Chat Engine (`rust_wx_core/`)
+
+Zero-`libc` (`#![no_std]`, `#![no_main]`, `-nodefaultlibs`, statically linked) Multi-ISA inference engine synthesizing a `Q8_0` (`F16C + AVX2 + FMA3`, `vpabsb + vpsignb + vpmaddubsw`) kernel inside a 3-page `[PROT_NONE][RX][PROT_NONE]` W^X arena, with zero-copy `mmap` + `MADV_HUGEPAGE` GGUF indexer, Lock-Free `SYS_clone` + `PAUSE` thread pool (`0 futex`), NEOX split-half RoPE, Causal GQA Attention (`12 Q : 2 KV` heads + KV-cache), exponential SwiGLU FFN (`8960`), and built-in `tokenizer.ggml.tokens` BPE tokenizer/decoder:
+
+- **L1i Footprint:** `13 527 B` `.text` (`41.3%` of 32 KB L1i, strictly `<= 16 KB`).
+- **End-to-End Inference:** `~94.6–99 ms/token` (`~10.1–10.6 full tok/s` across all 28 layers x 7 projections + `151,936`-vocab `LM Head Argmax` = `1.54B` `Q8_0` params/token on 4-core Haswell `i5-4590` DDR3).
