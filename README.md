@@ -21,3 +21,10 @@ make
 ./zero-llm -m /path/to/model.gguf "Hello! Reply in 5 words:"
 ./zero-llm -m /path/to/model.gguf   # Interactive chat (/clear, /exit)
 ```
+
+## Standalone 0-Dependency Rust + Raw ASM W^X Core (`rust_wx_core/`)
+
+Zero-`libc` (`#![no_std]`, `#![no_main]`, `-nodefaultlibs`) Multi-ISA inference engine synthesizing a `102 B` `Q8_0` (`F16C + AVX2 + FMA3`) kernel inside a 3-page `[PROT_NONE][RX][PROT_NONE]` W^X arena, zero-copy `mmap` + `MADV_HUGEPAGE` GGUF indexer, Lock-Free `SYS_clone` + `PAUSE` thread pool (`0 futex`), and `tokenizer.ggml.tokens` UTF-8 decoder:
+
+- **L1i Footprint:** `11 264 B` `.text` (`34.3%` of 32 KB L1i).
+- **Throughput:** `284.6M` cycles (`~86.2 ms` / `~11.6 full tok/s` across all 28 layers x 7 projections + `151,936`-vocab `LM Head Argmax` = `1.54B` `Q8_0` params/token on 4-core Haswell `i5-4590` DDR3 — `4.66x` faster than the early `2.49 tok/s` probe).
