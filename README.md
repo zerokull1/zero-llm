@@ -74,3 +74,5 @@ Licensed under **GNU AGPL-3.0** (`LICENSE` and `NOTICE`). Original Author & Arch
 ## Universal Hardware-Adaptive GPFIFO + GPPut Fast-Path (26 Nov 2026)
 - **Hardware-Independent Ring Auto-Detector:** Dynamically discovers compatible compute ring/doorbell offsets via monotonic memory-page calibration (`Self-Test` verified) with automatic zero-dependency SWAR/CPU fallback on headless or non-GPU hosts.
 - **Zero-Syscall / Zero-Driver Hot Loop:** Eliminates per-dispatch driver submission overhead (`12.39 µs` vs `17.17 µs`, **1.39x throughput gain**, **80,716 ops/sec**, lower CPU/GPU thermal load).
+
+> **Status:** `Feature Freeze` on single-GPU desktop — ready for multi-GPU rack deployment (antivirus/EDR threat classification module).
