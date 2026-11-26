@@ -7,6 +7,7 @@
 #include <string.h>
 
 #if defined(__x86_64__)
+#include <immintrin.h>
 #define ZK_SFENCE() __asm__ __volatile__("sfence" ::: "memory")
 #define ZK_PAUSE()  __builtin_ia32_pause()
 #elif defined(__aarch64__)
@@ -29,10 +30,15 @@ typedef struct {
     uint32_t ndesc;
     uint32_t cur_put;
     uint32_t ring_mask;
+    uint32_t soliton_delta_en;
+    uint32_t _pad0;
     uint64_t *ring_ptr;
     const volatile uint32_t *get_ptr;
     volatile uint32_t *put_ptr;
-    uint64_t desc[64];
+    uint64_t soliton_lines_sent;
+    uint64_t soliton_lines_skipped;
+    __attribute__((aligned(64))) uint64_t desc[64];
+    __attribute__((aligned(64))) uint64_t shadow_desc[64];
     char device_name[128];
 } ZkGpuRingCtx;
 
@@ -54,11 +60,72 @@ static inline uint32_t zk_swar_batch_entropy_score(const uint8_t *buf, size_t le
     return (uint32_t)(acc ^ (acc >> 32));
 }
 
+static inline size_t zk_soliton_delta_stream_64b(
+    void * __restrict__ dst64,
+    const void * __restrict__ src64,
+    void * __restrict__ shadow64,
+    size_t len_bytes,
+    int delta_filter
+) {
+    size_t lines = len_bytes >> 6;
+    size_t sent = 0;
+    uint8_t *d = (uint8_t *)dst64;
+    const uint8_t *s = (const uint8_t *)src64;
+    uint8_t *sh = (uint8_t *)shadow64;
+#if defined(__x86_64__) && defined(__AVX2__)
+    if (((uintptr_t)d & 63u) == 0 && ((uintptr_t)s & 63u) == 0 &&
+        (!delta_filter || (sh && ((uintptr_t)sh & 63u) == 0))) {
+        for (size_t l = 0; l < lines; l++) {
+            const __m256i *sp = (const __m256i *)(s + (l << 6));
+            __m256i *dp = (__m256i *)(d + (l << 6));
+            __m256i s0 = _mm256_load_si256(sp);
+            __m256i s1 = _mm256_load_si256(sp + 1);
+            if (delta_filter && sh) {
+                __m256i *pp = (__m256i *)(sh + (l << 6));
+                __m256i d0 = _mm256_xor_si256(s0, _mm256_load_si256(pp));
+                __m256i d1 = _mm256_xor_si256(s1, _mm256_load_si256(pp + 1));
+                __m256i diff = _mm256_or_si256(d0, d1);
+                if (_mm256_testz_si256(diff, diff)) continue;
+                _mm256_store_si256(pp, s0);
+                _mm256_store_si256(pp + 1, s1);
+            }
+            _mm256_stream_si256(dp, s0);
+            _mm256_stream_si256(dp + 1, s1);
+            sent++;
+        }
+        if (sent > 0) ZK_SFENCE();
+        return sent;
+    }
+#endif
+    for (size_t l = 0; l < lines; l++) {
+        const uint64_t *sp = (const uint64_t *)(s + (l << 6));
+        uint64_t *dp = (uint64_t *)(d + (l << 6));
+        if (delta_filter && sh) {
+            uint64_t *pp = (uint64_t *)(sh + (l << 6));
+            uint64_t diff = 0;
+            for (size_t k = 0; k < 8; k++) diff |= (sp[k] ^ pp[k]);
+            if (diff == 0) continue;
+            memcpy(pp, sp, 64);
+        }
+        memcpy(dp, sp, 64);
+        sent++;
+    }
+    if (sent > 0) ZK_SFENCE();
+    return sent;
+}
+
 static inline void zk_gpu_ring_init(ZkGpuRingCtx *ctx) {
     if (!ctx) return;
     memset(ctx, 0, sizeof(*ctx));
     ctx->mode = ZK_ACCEL_CPU_SWAR;
+    ctx->soliton_delta_en = 1u;
     memcpy(ctx->device_name, "Universal-SWAR-CPU", 19);
+}
+
+static inline void zk_gpu_ring_enable_soliton_delta(ZkGpuRingCtx *ctx, uint32_t enable) {
+    if (!ctx) return;
+    ctx->soliton_delta_en = enable ? 1u : 0u;
+    if (enable) memset(ctx->shadow_desc, 0, sizeof(ctx->shadow_desc));
 }
 
 static inline int zk_gpu_ring_submit_pipelined(ZkGpuRingCtx *ctx, uint32_t win_slots) {
@@ -71,12 +138,23 @@ static inline int zk_gpu_ring_submit_pipelined(ZkGpuRingCtx *ctx, uint32_t win_s
         while (((put - *ctx->get_ptr) & mask) >= limit && spin++ < 50000000ULL) {
             ZK_PAUSE();
         }
-        for (uint32_t d = 0; d < ctx->ndesc; d++) {
-            ctx->ring_ptr[(put + d) & mask] = ctx->desc[d];
+        uint32_t idx = put & mask;
+        uint32_t lines64 = ctx->ndesc >> 3;
+        if (lines64 > 0 && (ctx->ndesc & 7u) == 0 && (idx + ctx->ndesc) <= (mask + 1u) &&
+            (((uintptr_t)&ctx->ring_ptr[idx]) & 63u) == 0) {
+            size_t sent = zk_soliton_delta_stream_64b(
+                &ctx->ring_ptr[idx], ctx->desc, ctx->shadow_desc,
+                (size_t)ctx->ndesc * sizeof(uint64_t), (int)ctx->soliton_delta_en);
+            ctx->soliton_lines_sent += sent;
+            ctx->soliton_lines_skipped += (lines64 - sent);
+        } else {
+            for (uint32_t d = 0; d < ctx->ndesc; d++) {
+                ctx->ring_ptr[(put + d) & mask] = ctx->desc[d];
+            }
+            ZK_SFENCE();
         }
         put = (put + ctx->ndesc) & mask;
         ctx->cur_put = put;
-        ZK_SFENCE();
         *ctx->put_ptr = put;
         return 0;
     }
