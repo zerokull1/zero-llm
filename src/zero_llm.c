@@ -1,3 +1,4 @@
+#include "zero_gpu_ring_fastpath.h"
 // ZEROMANI (zerokull1) | Author Signature: 0x5A45524F4D414E49ULL
 #define _GNU_SOURCE
 #include <stdint.h>

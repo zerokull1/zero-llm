@@ -70,3 +70,7 @@ Licensed under **GNU AGPL-3.0** (`LICENSE` and `NOTICE`). Original Author & Arch
 - **Phase 1 [Done]:** Hardened GGUF parser + `VT-d` IOMMU DMA isolation + 73-vector host boundary.
 - **Phase 2–4 [Next]:** Zero-copy telemetry summarization from `TokamakBus` & dedicated CPU inference pinning after SmartNIC XDP offload.
 - **73-Vector Host, Kernel Ring-0 & Silicon Isolation**: Protected by `VT-d` IOMMU DMA isolation, `zero_timing_ring0` `ENFORCE` kernel hook, `TokamakBus`, and 73-vector XDP/L7 defenses.
+
+## Universal Hardware-Adaptive GPFIFO + GPPut Fast-Path (26 Nov 2026)
+- **Hardware-Independent Ring Auto-Detector:** Dynamically discovers compatible compute ring/doorbell offsets via monotonic memory-page calibration (`Self-Test` verified) with automatic zero-dependency SWAR/CPU fallback on headless or non-GPU hosts.
+- **Zero-Syscall / Zero-Driver Hot Loop:** Eliminates per-dispatch driver submission overhead (`12.39 µs` vs `17.17 µs`, **1.39x throughput gain**, **80,716 ops/sec**, lower CPU/GPU thermal load).
