@@ -46,6 +46,34 @@ static inline uint32_t zk_swar_batch_entropy_score(const uint8_t *buf, size_t le
     if (!buf || len == 0) return 0;
     uint64_t acc = 0x9E3779B97F4A7C15ULL;
     size_t i = 0;
+#if defined(__x86_64__) && defined(__AVX2__)
+    if (len >= 128) {
+        __m256i v0 = _mm256_set1_epi64x(0x9E3779B97F4A7C15ULL);
+        __m256i v1 = _mm256_set1_epi64x(0xBF58476D1CE4E5B9ULL);
+        __m256i v2 = _mm256_set1_epi64x(0x94D049BB133111EBULL);
+        __m256i v3 = _mm256_set1_epi64x(0xD6E8FEB86659FD93ULL);
+        const __m256i mul = _mm256_set1_epi32(0x85EBCA6B);
+        for (; i + 128 <= len; i += 128) {
+            __m256i d0 = _mm256_loadu_si256((const __m256i *)(buf + i));
+            __m256i d1 = _mm256_loadu_si256((const __m256i *)(buf + i + 32));
+            __m256i d2 = _mm256_loadu_si256((const __m256i *)(buf + i + 64));
+            __m256i d3 = _mm256_loadu_si256((const __m256i *)(buf + i + 96));
+            v0 = _mm256_mullo_epi32(_mm256_xor_si256(v0, d0), mul);
+            v1 = _mm256_mullo_epi32(_mm256_xor_si256(v1, d1), mul);
+            v2 = _mm256_mullo_epi32(_mm256_xor_si256(v2, d2), mul);
+            v3 = _mm256_mullo_epi32(_mm256_xor_si256(v3, d3), mul);
+            v0 = _mm256_xor_si256(v0, _mm256_srli_epi64(v0, 29));
+            v1 = _mm256_xor_si256(v1, _mm256_srli_epi64(v1, 31));
+            v2 = _mm256_xor_si256(v2, _mm256_srli_epi64(v2, 27));
+            v3 = _mm256_xor_si256(v3, _mm256_srli_epi64(v3, 33));
+        }
+        __m256i comb = _mm256_xor_si256(_mm256_xor_si256(v0, v1), _mm256_xor_si256(v2, v3));
+        uint64_t lanes[4];
+        _mm256_storeu_si256((__m256i *)lanes, comb);
+        acc ^= lanes[0] ^ (lanes[1] << 7) ^ (lanes[2] >> 5) ^ (lanes[3] << 13);
+        acc *= 0xBF58476D1CE4E5B9ULL;
+    }
+#endif
     for (; i + 8 <= len; i += 8) {
         uint64_t w = 0;
         memcpy(&w, buf + i, 8);
@@ -60,6 +88,8 @@ static inline uint32_t zk_swar_batch_entropy_score(const uint8_t *buf, size_t le
     return (uint32_t)(acc ^ (acc >> 32));
 }
 
+#ifndef ZK_SOLITON_DELTA_STREAM_DEFINED
+#define ZK_SOLITON_DELTA_STREAM_DEFINED
 static inline size_t zk_soliton_delta_stream_64b(
     void * __restrict__ dst64,
     const void * __restrict__ src64,
@@ -113,6 +143,7 @@ static inline size_t zk_soliton_delta_stream_64b(
     if (sent > 0) ZK_SFENCE();
     return sent;
 }
+#endif
 
 static inline void zk_gpu_ring_init(ZkGpuRingCtx *ctx) {
     if (!ctx) return;
